@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use futures::future;
 use fxhash::{FxHashMap, FxHashSet};
 use netidx::{pack::Pack, path::Path as NPath, publisher::Value, utils::pack};
-use netidx_container::{Container, Db, Params as ContainerParams, Txn};
+use netidx_container::{Container, Params as ContainerParams, Txn};
 use netidx_tools::ClientParams;
 use std::{
     collections::{HashMap, HashSet},
@@ -120,22 +120,21 @@ fn set_str(
     txn.set_data(true, key, val, None);
 }
 
-fn scan_track(path: &str, base: &NPath, db: &Db) -> Result<()> {
+fn scan_track(txn: &mut Txn, path: &str, base: &NPath) -> Result<()> {
     use lofty::{read_from_path, Accessor};
     let hash = hash_file(&path)?;
     let tagged = read_from_path(path, false)?;
-    let mut txn = Txn::new();
-    set_str(&mut txn, &hash, base, "file", Some(path));
+    set_str(txn, &hash, base, "file", Some(path));
     if let Some(tag) = tagged.primary_tag() {
-        set_str(&mut txn, &hash, base, "artist", tag.artist());
-        set_str(&mut txn, &hash, base, "title", tag.title());
-        set_str(&mut txn, &hash, base, "album", tag.album());
-        set_str(&mut txn, &hash, base, "genre", tag.genre());
+        set_str(txn, &hash, base, "artist", tag.artist());
+        set_str(txn, &hash, base, "title", tag.title());
+        set_str(txn, &hash, base, "album", tag.album());
+        set_str(txn, &hash, base, "genre", tag.genre());
     }
-    Ok(db.commit(txn))
+    Ok(())
 }
 
-fn scan_dir(dir: &str, base: &NPath, db: &Db) -> Result<()> {
+fn scan_dir(dir: &str, base: &NPath, container: &Container) -> Result<()> {
     use rayon::prelude::*;
     let tracks = fs::read_dir(dir)?
         .filter_map(|r| {
@@ -148,27 +147,37 @@ fn scan_dir(dir: &str, base: &NPath, db: &Db) -> Result<()> {
             }
         })
         .collect::<Vec<_>>();
-    tracks.par_iter().for_each(|track| {
-        let _ = scan_track(&track, base, db);
-    });
+    tracks
+        .par_iter()
+        .fold(Txn::new, |mut txn, track| {
+            let _ = scan_track(&mut txn, &track, base);
+            txn
+        })
+        .for_each(|txn| {
+            let _ = container.commit_unbounded(txn);
+        });
     Ok(())
 }
 
-fn scan_dirs(dirs: &FxHashSet<String>, base: &NPath, db: &Db) -> Result<()> {
+fn scan_dirs(
+    dirs: &FxHashSet<String>,
+    base: &NPath,
+    container: &Container,
+) -> Result<()> {
     use rayon::prelude::*;
-    dirs.par_iter().map(|dir| scan_dir(dir, base, db)).collect::<Result<()>>()
+    dirs.par_iter().map(|dir| scan_dir(dir, base, container)).collect::<Result<()>>()
 }
 
 // only scan tracks if their containing directory has been modified
 fn scan_modified(
     path: &str,
     base: &NPath,
-    db: &Db,
+    container: &Container,
     dirs_tree: &sled::Tree,
 ) -> Result<()> {
     let dirs = dirs(path)?;
     let to_scan = dirs_to_scan(&dirs, &dirs_tree)?;
-    Ok(scan_dirs(&to_scan, &base, &db)?)
+    Ok(scan_dirs(&to_scan, &base, container)?)
 }
 
 // scan every track in the library
@@ -186,7 +195,7 @@ fn scan_everything(
 }
 */
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Params::from_args();
     let base = NPath::from(args.base);
@@ -195,6 +204,6 @@ async fn main() -> Result<()> {
     //let publisher = container.publisher().await?;
     let db = container.db().await?;
     let dirs_tree = db.open_tree("dirs")?;
-    block_in_place(|| scan_modified(&args.library_path, &base, &db, &dirs_tree))?;
+    block_in_place(|| scan_modified(&args.library_path, &base, &container, &dirs_tree))?;
     Ok(future::pending().await) // don't quit until we are killed
 }
