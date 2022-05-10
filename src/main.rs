@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use futures::future;
 use fxhash::{FxHashMap, FxHashSet};
 use netidx::{pack::Pack, path::Path as NPath, publisher::Value, utils::pack};
-use netidx_container::{Container, Params as ContainerParams, Txn};
+use netidx_container::{Container, Db, Params as ContainerParams, Txn};
 use netidx_tools::ClientParams;
 use std::{
     collections::{HashMap, HashSet},
@@ -105,31 +105,24 @@ fn hash_file(path: &str) -> Result<md5::Digest> {
     Ok(ctx.compute())
 }
 
-fn set_str(
-    txn: &mut Txn,
-    hash: &md5::Digest,
-    base: &NPath,
-    name: &str,
-    val: Option<&str>,
-) {
-    let key = base.append(&format!("{:x}/{}", hash, name));
-    let val = match val {
-        None => Value::Null,
-        Some(val) => Value::from(String::from(val)),
-    };
-    txn.set_data(true, key, val, None);
-}
-
 fn scan_track(txn: &mut Txn, path: &str, base: &NPath) -> Result<()> {
     use lofty::{read_from_path, Accessor};
     let hash = hash_file(&path)?;
+    let mut set = |name, val| {
+        let key = base.append(&format!("tracks/{:x}/{}", hash, name));
+        let val = match val {
+            None => Value::Null,
+            Some(val) => Value::from(String::from(val)),
+        };
+        txn.set_data(true, key, val, None);
+    };
     let tagged = read_from_path(path, false)?;
-    set_str(txn, &hash, base, "file", Some(path));
+    set("file", Some(path));
     if let Some(tag) = tagged.primary_tag() {
-        set_str(txn, &hash, base, "artist", tag.artist());
-        set_str(txn, &hash, base, "title", tag.title());
-        set_str(txn, &hash, base, "album", tag.album());
-        set_str(txn, &hash, base, "genre", tag.genre());
+        set("artist", tag.artist());
+        set("title", tag.title());
+        set("album", tag.album());
+        set("genre", tag.genre());
     }
     Ok(())
 }
@@ -181,29 +174,46 @@ fn scan_modified(
 }
 
 // scan every track in the library
-/*
 fn scan_everything(
     path: &str,
     base: &NPath,
-    db: &Db,
+    container: &Container,
     dirs_tree: &sled::Tree,
 ) -> Result<()> {
     let dirs = dirs(path)?;
     let _ = dirs_to_scan(&dirs, &dirs_tree)?; // store the dirs mod timestamps
     let to_scan = dirs.into_iter().map(|(k, _)| k).collect::<FxHashSet<String>>();
-    Ok(scan_dirs(&to_scan, &base, &db)?)
+    Ok(scan_dirs(&to_scan, &base, container)?)
 }
-*/
+
+async fn init(library_path: &str, base: NPath, container: &Container) -> Result<()> {
+    let db = container.db().await?;
+    let roots = db.roots().collect::<Result<Vec<_>>>()?;
+    let dirs_tree = db.open_tree("dirs")?;
+    if roots.contains(&base) {
+        block_in_place(|| scan_modified(library_path, &base, &container, &dirs_tree))?;
+    } else {
+        block_in_place(|| {
+            dirs_tree.clear()?;
+            db.clear()?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        let mut txn = Txn::new();
+        txn.add_root(base.clone(), None);
+        txn.set_locked(base.clone(), None);
+        container.commit(txn).await?;
+        block_in_place(|| scan_everything(library_path, &base, container, &dirs_tree))?;
+    }
+    Ok(())
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Params::from_args();
-    let base = NPath::from(args.base);
+    let base = NPath::from(&args.base.clone());
     let (config, desired_auth) = args.client_params.load();
     let container = Container::start(config, desired_auth, args.container_config).await?;
+    init(&args.library_path, base, &container).await?;
     //let publisher = container.publisher().await?;
-    let db = container.db().await?;
-    let dirs_tree = db.open_tree("dirs")?;
-    block_in_place(|| scan_modified(&args.library_path, &base, &container, &dirs_tree))?;
     Ok(future::pending().await) // don't quit until we are killed
 }
