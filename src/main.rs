@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use futures::future;
 use fxhash::{FxHashMap, FxHashSet};
 use netidx::{pack::Pack, path::Path as NPath, publisher::Value, utils::pack};
-use netidx_container::{Container, Db, Params as ContainerParams, Txn};
+use netidx_container::{Container, Params as ContainerParams, Txn};
 use netidx_tools::ClientParams;
 use std::{
     collections::{HashMap, HashSet},
