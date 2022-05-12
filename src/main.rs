@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH}, hash::Hash,
 };
 use structopt::StructOpt;
 use tokio::task::block_in_place;
@@ -43,18 +43,22 @@ enum ToPlayer {
     Terminate,
 }
 
-#[derive(Clone)]
-struct Player(glib::Sender<ToPlayer>);
+struct PlayerInner {
+    to: glib::Sender<ToPlayer>,
+}
 
-impl Drop for Player {
+impl Drop for PlayerInner {
     fn drop(&mut self) {
-        let _ = self.0.send(ToPlayer::Terminate);
+        let _ = self.to.send(ToPlayer::Terminate);
     }
 }
 
+#[derive(Clone)]
+struct Player(Arc<PlayerInner>);
+
 impl Player {
     fn task(rx: glib::Receiver<ToPlayer>) -> Result<()> {
-        gstreamer::init()?;
+        dbg!(gstreamer::init()?);
         let main_loop = glib::MainLoop::new(None, false);
         let dispatcher = gstreamer_player::PlayerGMainContextSignalDispatcher::new(None);
         let player = gstreamer_player::Player::new(
@@ -69,6 +73,8 @@ impl Player {
             error!("player error: {}", error);
             player.stop();
         });
+        dbg!(());
+        let _main_loop = main_loop.clone();
         rx.attach(None, move |m| match m {
             ToPlayer::Play(s) => {
                 info!("player now playing {}", &s);
@@ -84,10 +90,13 @@ impl Player {
             }
             ToPlayer::Terminate => {
                 info!("player shutting down");
+                _main_loop.quit();
                 glib::Continue(false)
             }
         });
+        dbg!(());
         main_loop.run();
+        dbg!(());
         Ok(())
     }
 
@@ -97,16 +106,16 @@ impl Player {
             Ok(()) => info!("player task stopped"),
             Err(e) => error!("player task stopped with error: {}", e),
         });
-        Player(tx)
+        Player(Arc::new(PlayerInner { to: tx }))
     }
 
     fn play(&self, file: &str) -> Result<()> {
         let uri = format!("file://{}", file);
-        Ok(self.0.send(ToPlayer::Play(uri))?)
+        Ok(self.0.to.send(ToPlayer::Play(uri))?)
     }
 
     fn stop(&self) -> Result<()> {
-        Ok(self.0.send(ToPlayer::Stop)?)
+        Ok(self.0.to.send(ToPlayer::Stop)?)
     }
 }
 
@@ -170,6 +179,7 @@ impl RpcApi {
             .into_iter()
             .collect(),
             Arc::new(move |_addr, mut args| {
+                dbg!(&args);
                 let player = player.clone();
                 let db = db.clone();
                 Box::pin(async move {
@@ -180,8 +190,9 @@ impl RpcApi {
                             _ => return Self::err("track id must be a single string"),
                         },
                     };
-                    let file = match db.lookup(&*track) {
-                        Ok(Some(Datum::Data(Value::String(f)))) => f,
+                    let file = format!("{}/file", &*track);
+                    let file = match db.lookup(dbg!(&file)) {
+                        Ok(Some(Datum::Data(Value::String(f)))) => dbg!(f),
                         Ok(Some(_)) | Ok(None) | Err(_) => {
                             return Self::err("track not found")
                         }
