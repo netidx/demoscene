@@ -180,19 +180,10 @@ impl RpcApi {
                             _ => return Self::err("track id must be a single string"),
                         },
                     };
-                    let file = {
-                        let mut roots = db.roots();
-                        let file = format!("tracks/{}/file", track);
-                        loop {
-                            match roots.next() {
-                                None | Some(Err(_)) => {
-                                    return Self::err("track not found")
-                                }
-                                Some(Ok(root)) => match db.lookup(&*root.append(&file)) {
-                                    Ok(Some(Datum::Data(Value::String(f)))) => break f,
-                                    Ok(Some(_)) | Ok(None) | Err(_) => (),
-                                },
-                            }
+                    let file = match db.lookup(&*track) {
+                        Ok(Some(Datum::Data(Value::String(f)))) => f,
+                        Ok(Some(_)) | Ok(None) | Err(_) => {
+                            return Self::err("track not found")
                         }
                     };
                     match player.play(&*file) {
