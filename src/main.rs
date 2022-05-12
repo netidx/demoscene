@@ -1,14 +1,25 @@
 use anyhow::{anyhow, bail, Result};
 use futures::future;
 use fxhash::{FxHashMap, FxHashSet};
-use netidx::{pack::Pack, path::Path as NPath, publisher::Value, utils::pack};
-use netidx_container::{Container, Params as ContainerParams, Txn};
+use gstreamer::prelude::*;
+use log::{error, info};
+use netidx::{
+    chars::Chars,
+    pack::Pack,
+    path::Path as NPath,
+    publisher::{Publisher, Value},
+    utils::pack,
+};
+use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
+use netidx_protocols::rpc::server as rpc;
 use netidx_tools::ClientParams;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::Read,
     path::PathBuf,
+    sync::Arc,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
@@ -24,6 +35,174 @@ struct Params {
     library_path: String,
     #[structopt(long = "base", help = "base path of the app in netidx")]
     base: String,
+}
+
+enum ToPlayer {
+    Play(String),
+    Stop,
+    Terminate,
+}
+
+#[derive(Clone)]
+struct Player(glib::Sender<ToPlayer>);
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.0.send(ToPlayer::Terminate);
+    }
+}
+
+impl Player {
+    fn task(rx: glib::Receiver<ToPlayer>) -> Result<()> {
+        gstreamer::init()?;
+        let main_loop = glib::MainLoop::new(None, false);
+        let dispatcher = gstreamer_player::PlayerGMainContextSignalDispatcher::new(None);
+        let player = gstreamer_player::Player::new(
+            gstreamer_player::PlayerVideoRenderer::NONE,
+            Some(&dispatcher.upcast::<gstreamer_player::PlayerSignalDispatcher>()),
+        );
+        player.connect_end_of_stream(|player| {
+            info!("player finished playing");
+            player.stop();
+        });
+        player.connect_error(|player, error| {
+            error!("player error: {}", error);
+            player.stop();
+        });
+        rx.attach(None, move |m| match m {
+            ToPlayer::Play(s) => {
+                info!("player now playing {}", &s);
+                player.set_uri(Some(&s));
+                player.play();
+                glib::Continue(true)
+            }
+            ToPlayer::Stop => {
+                info!("player stopped");
+                player.set_uri(None);
+                player.stop();
+                glib::Continue(true)
+            }
+            ToPlayer::Terminate => {
+                info!("player shutting down");
+                glib::Continue(false)
+            }
+        });
+        main_loop.run();
+        Ok(())
+    }
+
+    fn new() -> Self {
+        let (tx, rx) = glib::MainContext::channel(glib::PRIORITY_LOW);
+        thread::spawn(move || match Self::task(rx) {
+            Ok(()) => info!("player task stopped"),
+            Err(e) => error!("player task stopped with error: {}", e),
+        });
+        Player(tx)
+    }
+
+    fn play(&self, file: &str) -> Result<()> {
+        let uri = format!("file://{}", file);
+        Ok(self.0.send(ToPlayer::Play(uri))?)
+    }
+
+    fn stop(&self) -> Result<()> {
+        Ok(self.0.send(ToPlayer::Stop)?)
+    }
+}
+
+struct RpcApi {
+    _play: rpc::Proc,
+    _stop: rpc::Proc,
+}
+
+impl RpcApi {
+    fn new(
+        api_path: NPath,
+        publisher: &Publisher,
+        player: Player,
+        db: Db,
+    ) -> Result<Self> {
+        let _play = Self::start_play_rpc(&api_path, publisher, player.clone(), db)?;
+        let _stop = Self::start_stop_rpc(&api_path, publisher, player.clone())?;
+        Ok(RpcApi { _play, _stop })
+    }
+
+    fn err(s: &'static str) -> Value {
+        Value::Error(Chars::from(s))
+    }
+
+    fn start_stop_rpc(
+        base_path: &NPath,
+        publisher: &Publisher,
+        player: Player,
+    ) -> Result<rpc::Proc> {
+        rpc::Proc::new(
+            publisher,
+            base_path.append("stop"),
+            Value::from("stop playing"),
+            HashMap::default(),
+            Arc::new(move |_addr, _args| {
+                let player = player.clone();
+                Box::pin(async move {
+                    match player.stop() {
+                        Ok(()) => Value::Ok,
+                        Err(e) => Value::Error(Chars::from(e.to_string())),
+                    }
+                })
+            }),
+        )
+    }
+
+    fn start_play_rpc(
+        base_path: &NPath,
+        publisher: &Publisher,
+        player: Player,
+        db: Db,
+    ) -> Result<rpc::Proc> {
+        rpc::Proc::new(
+            publisher,
+            base_path.append("play"),
+            Value::from("play a track from the library"),
+            vec![(
+                Arc::from("track"),
+                (Value::Null, Value::from("the md5 sum of the track to play")),
+            )]
+            .into_iter()
+            .collect(),
+            Arc::new(move |_addr, mut args| {
+                let player = player.clone();
+                let db = db.clone();
+                Box::pin(async move {
+                    let track = match args.remove("track") {
+                        None => return Self::err("expected a track id"),
+                        Some(vs) => match &vs[..] {
+                            [Value::String(s)] => s.clone(),
+                            _ => return Self::err("track id must be a single string"),
+                        },
+                    };
+                    let file = {
+                        let mut roots = db.roots();
+                        let file = format!("tracks/{}/file", track);
+                        loop {
+                            match roots.next() {
+                                None | Some(Err(_)) => {
+                                    return Self::err("track not found")
+                                }
+                                Some(Ok(root)) => match db.lookup(&*root.append(&file)) {
+                                    Ok(Some(Datum::Data(Value::String(f)))) => break f,
+                                    Ok(Some(_)) | Ok(None) | Err(_) => (),
+                                },
+                            }
+                        }
+                    };
+                    match player.play(&*file) {
+                        Ok(()) => Value::Ok,
+                        Err(e) => Value::Error(Chars::from(e.to_string())),
+                    }
+                })
+            }),
+        )
+    }
 }
 
 fn dirs(path: &str) -> Result<FxHashMap<String, SystemTime>> {
@@ -123,6 +302,11 @@ fn scan_track(txn: &mut Txn, path: &str, base: &NPath) -> Result<()> {
         set("title", tag.title());
         set("album", tag.album());
         set("genre", tag.genre());
+    } else {
+        set("artist", None);
+        set("title", None);
+        set("album", None);
+        set("genre", None);
     }
     Ok(())
 }
@@ -186,7 +370,11 @@ fn scan_everything(
     Ok(scan_dirs(&to_scan, &base, container)?)
 }
 
-async fn init(library_path: &str, base: NPath, container: &Container) -> Result<()> {
+async fn init_library(
+    library_path: &str,
+    base: NPath,
+    container: &Container,
+) -> Result<()> {
     let db = container.db().await?;
     let roots = db.roots().collect::<Result<Vec<_>>>()?;
     let dirs_tree = db.open_tree("dirs")?;
@@ -210,10 +398,15 @@ async fn init(library_path: &str, base: NPath, container: &Container) -> Result<
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Params::from_args();
+    env_logger::init();
     let base = NPath::from(&args.base.clone());
+    let api_path = NPath::from(args.container_config.api_path.clone());
     let (config, desired_auth) = args.client_params.load();
     let container = Container::start(config, desired_auth, args.container_config).await?;
-    init(&args.library_path, base, &container).await?;
-    //let publisher = container.publisher().await?;
+    let publisher = container.publisher().await?;
+    let db = container.db().await?;
+    init_library(&args.library_path, base, &container).await?;
+    let player = Player::new();
+    let _rpcs = RpcApi::new(api_path, &publisher, player, db)?;
     Ok(future::pending().await) // don't quit until we are killed
 }

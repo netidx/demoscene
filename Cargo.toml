@@ -3,17 +3,33 @@ name = "demoscene"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = true
+debug = false
+
+[profile.dev]
+opt-level = "s"
+lto = "thin"
+debug = 1
+
 [dependencies]
-futures = "0.3"
 anyhow = "1"
+env_logger = "0.9"
+futures = "0.3"
 fxhash = "0.2"
+glib = "0.15"
 gstreamer = "0.18"
+gstreamer-player = "0.18"
 lofty = "0.6"
+log = "0.4"
 md5 = "0.7"
 netidx-container = { version = "0.10", path = "../netidx/netidx-container" }
+netidx-protocols = { version = "0.10", path = "../netidx/netidx-protocols" }
 netidx-tools = { version = "0.10", path = "../netidx/netidx-tools" }
 netidx = { version = "0.10", path = "../netidx/netidx" }
+rayon = "1"
 sled = { version = "0.34", features = ["zstd", "compression"] }
 structopt = "0.3"
 tokio = { version = "1", features = ["full"] }
-rayon = "1"
