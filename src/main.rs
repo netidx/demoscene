@@ -138,7 +138,7 @@ impl RpcApi {
     ) -> Result<rpc::Proc> {
         rpc::Proc::new(
             publisher,
-            base_path.append("stop"),
+            base_path.append("rpcs/stop"),
             Value::from("stop playing"),
             HashMap::default(),
             Arc::new(move |_addr, _args| {
@@ -161,7 +161,7 @@ impl RpcApi {
     ) -> Result<rpc::Proc> {
         rpc::Proc::new(
             publisher,
-            base_path.append("play"),
+            base_path.append("rpcs/play"),
             Value::from("play a track from the library"),
             vec![(
                 Arc::from("track"),
