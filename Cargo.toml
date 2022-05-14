@@ -15,6 +15,7 @@ lto = "thin"
 debug = 1
 
 [dependencies]
+arcstr = "1"
 anyhow = "1"
 env_logger = "0.9"
 futures = "0.3"

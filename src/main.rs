@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use arcstr::ArcStr;
 use futures::future;
 use fxhash::{FxHashMap, FxHashSet};
 use gstreamer::prelude::*;
@@ -207,63 +208,138 @@ impl RpcApi {
     }
 }
 
-struct FilteredTrack {
-    title: Val,
-    album: Val,
-    artist: Val,
-    genre: Val,
+struct Artist {
+    tracks: FxHashSet<NPath>,
+    albums: FxHashSet<String>,
 }
 
-impl FilteredTrack {
-    fn publish(
-        publisher: Publisher,
-        base: NPath,
-        id: usize,
-        width: usize,
-        title: Value,
-        album: Value,
-        artist: Value,
-        genre: Value,
-    ) -> Result<FilteredTrack> {
-        let base = base.append(&format!("{:0cw$}", id, cw = width));
-        let title = publisher.publish(base.append("title"), title)?;
-        let album = publisher.publish(base.append("album"), album)?;
-        let artist = publisher.publish(base.append("artist"), artist)?;
-        let genre = publisher.publish(base.append("genre"), genre)?;
-        Ok(FilteredTrack { title, album, artist, genre })
-    }
-}
-
-struct FilteredDisplay {
-    tracks: Vec<FilteredTrack>,
-    artists: Vec<Val>,
-    albums: Vec<Val>,
+struct Display {
+    artists: FxHashMap<String, Artist>,
+    albums: FxHashMap<String, FxHashSet<NPath>>,
     selected_artists: Val,
     selected_albums: Val,
     filter: Val,
     db: Db,
+    container: Container,
     publisher: Publisher,
     base: NPath,
+    artists_path: NPath,
+    albums_path: NPath,
+    tracks_path: NPath,
 }
 
-impl FilteredDisplay {
-    async fn run(mut self) {
+impl Display {
+    fn clear_prefix(&self, txn: &mut Txn, prefix: &NPath) -> Result<()> {
+        for r in self.db.iter_prefix(&**prefix) {
+            let (path, _, _) = r?;
+            txn.set_data(true, path, Value::Null, None);
+        }
+        Ok(())
     }
 
-    fn new(base: NPath, db: Db, publisher: Publisher) -> Result<FilteredDisplay> {
+    async fn update(
+        &mut self,
+        selected_artists: &FxHashSet<String>,
+        selected_albums: &FxHashSet<String>,
+        filter: &Option<String>,
+    ) -> Result<()> {
+        let mut txn = Txn::new();
+        self.clear_prefix(&mut txn, &self.artists_path)?;
+        self.clear_prefix(&mut txn, &self.albums_path)?;
+        self.clear_prefix(&mut txn, &self.tracks_path)?;
+        self.container.commit(txn).await?;
+
+        Ok(())
+    }
+
+    async fn run(mut self) {}
+
+    async fn new(
+        base: NPath,
+        db: Db,
+        container: Container,
+        publisher: Publisher,
+    ) -> Result<Self> {
         let filter = publisher.publish(base.append("filter"), Value::Null)?;
-        let selected_albums = publisher.publish(base.append("selected-albums"), Value::Null)?;
-        let selected_artists = publisher.publish(base.append("selected-artists"), Value::Null)?;
-        Ok(FilteredDisplay {
-            tracks: vec![],
-            artists: vec![],
-            albums: vec![],
+        let selected_albums =
+            publisher.publish(base.append("selected-albums"), Value::Null)?;
+        let selected_artists =
+            publisher.publish(base.append("selected-artists"), Value::Null)?;
+        let artists_path = base.append("artists");
+        let albums_path = base.append("albums");
+        let tracks_path = base.append("filtered-tracks");
+        let mut artists = HashMap::default();
+        let mut albums = HashMap::default();
+        let mut n = 0;
+        let mut current_album = None;
+        for r in db.iter_prefix(&*base.append("tracks")) {
+            let (path, _, data) = r?;
+            let column =
+                NPath::basename(&path).ok_or_else(|| anyhow!("column missing"))?;
+            let track = NPath::dirname(&path).ok_or_else(|| anyhow!("missing id"))?;
+            let track = NPath::from(ArcStr::from(track));
+            let decode = || -> Result<Option<String>> {
+                match <Datum as Pack>::decode(&mut &*data)? {
+                    Datum::Deleted | Datum::Formula(_, _) => Ok(None),
+                    Datum::Data(Value::String(s)) => Ok(Some(String::from(s.trim()))),
+                    Datum::Data(_) => Ok(None),
+                }
+            };
+            match column {
+                "album" => {
+                    if let Some(album) = decode()? {
+                        current_album = Some(album.clone());
+                        albums
+                            .entry(album)
+                            .or_insert_with(|| HashSet::default())
+                            .insert(track);
+                    }
+                }
+                "artist" => {
+                    if let Some(artist) = decode()? {
+                        n += 1;
+                        let artist = artists.entry(artist).or_insert_with(|| Artist {
+                            tracks: HashSet::default(),
+                            albums: HashSet::default(),
+                        });
+                        artist.tracks.insert(track);
+                        if let Some(album) = current_album.take() {
+                            artist.albums.insert(album);
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        let mut txn = Txn::new();
+        let row_width = 1 + (n as f32).log10() as usize;
+        let rows = (0..n)
+            .into_iter()
+            .map(|i| Chars::from(format!("{:0width$}", i, width = row_width)))
+            .collect::<Vec<_>>();
+        let cols = vec![
+            Chars::from("title"),
+            Chars::from("album"),
+            Chars::from("artist"),
+            Chars::from("genre"),
+        ];
+        txn.create_table(artists_path.clone(), rows, cols, true, None);
+        let l = albums.len();
+        txn.create_sheet(albums_path.clone(), l, 1, l, 1, true, None);
+        txn.create_sheet(tracks_path.clone(), n, 4, n, 4, true, None);
+        Ok(Self {
+            artists,
+            albums,
             selected_artists,
             selected_albums,
             filter,
             db,
+            container,
             publisher,
-            base
+            base,
+            artists_path,
+            albums_path,
+            tracks_path,
         })
     }
 }
