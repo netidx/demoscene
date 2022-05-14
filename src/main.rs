@@ -7,7 +7,7 @@ use netidx::{
     chars::Chars,
     pack::Pack,
     path::Path as NPath,
-    publisher::{Publisher, Value},
+    publisher::{Publisher, Val, Value},
     utils::pack,
 };
 use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH}, hash::Hash,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
 use tokio::task::block_in_place;
@@ -204,6 +204,67 @@ impl RpcApi {
                 })
             }),
         )
+    }
+}
+
+struct FilteredTrack {
+    title: Val,
+    album: Val,
+    artist: Val,
+    genre: Val,
+}
+
+impl FilteredTrack {
+    fn publish(
+        publisher: Publisher,
+        base: NPath,
+        id: usize,
+        width: usize,
+        title: Value,
+        album: Value,
+        artist: Value,
+        genre: Value,
+    ) -> Result<FilteredTrack> {
+        let base = base.append(&format!("{:0cw$}", id, cw = width));
+        let title = publisher.publish(base.append("title"), title)?;
+        let album = publisher.publish(base.append("album"), album)?;
+        let artist = publisher.publish(base.append("artist"), artist)?;
+        let genre = publisher.publish(base.append("genre"), genre)?;
+        Ok(FilteredTrack { title, album, artist, genre })
+    }
+}
+
+struct FilteredDisplay {
+    tracks: Vec<FilteredTrack>,
+    artists: Vec<Val>,
+    albums: Vec<Val>,
+    selected_artists: Val,
+    selected_albums: Val,
+    filter: Val,
+    db: Db,
+    publisher: Publisher,
+    base: NPath,
+}
+
+impl FilteredDisplay {
+    async fn run(mut self) {
+    }
+
+    fn new(base: NPath, db: Db, publisher: Publisher) -> Result<FilteredDisplay> {
+        let filter = publisher.publish(base.append("filter"), Value::Null)?;
+        let selected_albums = publisher.publish(base.append("selected-albums"), Value::Null)?;
+        let selected_artists = publisher.publish(base.append("selected-artists"), Value::Null)?;
+        Ok(FilteredDisplay {
+            tracks: vec![],
+            artists: vec![],
+            albums: vec![],
+            selected_artists,
+            selected_albums,
+            filter,
+            db,
+            publisher,
+            base
+        })
     }
 }
 
