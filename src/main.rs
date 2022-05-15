@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use arcstr::ArcStr;
-use futures::{channel::mpsc, future, StreamExt};
+use futures::{channel::mpsc, StreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use gstreamer::prelude::*;
 use log::{error, info};
@@ -425,7 +425,7 @@ impl Display {
             let id = Value::String(Chars::from(String::from(&*track.id)));
             txn.set_data(true, base.append("id"), id, None);
         }
-        Ok(())
+        self.container.commit(txn).await
     }
 
     async fn run(mut self) {
