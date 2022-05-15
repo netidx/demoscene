@@ -35,4 +35,3 @@ regex = "1"
 sled = { version = "0.34", features = ["zstd", "compression"] }
 structopt = "0.3"
 tokio = { version = "1", features = ["full"] }
-sled = "0.34"

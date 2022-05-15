@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use arcstr::ArcStr;
-use futures::future;
+use futures::{channel::mpsc, future, StreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use gstreamer::prelude::*;
 use log::{error, info};
@@ -15,7 +15,6 @@ use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
 use netidx_protocols::rpc::server as rpc;
 use netidx_tools::ClientParams;
 use regex::Regex;
-use sled::IVec;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
@@ -254,22 +253,21 @@ struct Display {
     artists_path: NPath,
     albums_path: NPath,
     tracks_path: NPath,
-    width: u32,
+    width: usize,
 }
 
 impl Display {
-    fn iter_tracks(db: Db, base: &NPath) -> impl Iterator<Item = Track> {
+    fn iter_tracks(db: &Db, base: &NPath) -> impl Iterator<Item = Track> {
         let mut album = None;
         let mut artist = None;
         let mut genre = None;
         db.iter_prefix(base.append("tracks")).filter_map(move |r| {
             let (path, _, data) = r.ok()?;
-            let decode = || -> Option<Chars> {
-                match <Datum as Pack>::decode(&mut &*data) {
-                    Err(_) | Ok(Datum::Deleted | Datum::Formula(_, _)) => None,
-                    Ok(Datum::Data(Value::String(s))) => Some(s),
-                    Ok(Datum::Data(_)) => None,
-                }
+            let decode = || {
+                <Datum as Pack>::decode(&mut &*data).ok().and_then(|v| match v {
+                    Datum::Data(v) => v.cast_to::<Chars>().ok(),
+                    Datum::Deleted | Datum::Formula(_, _) => None,
+                })
             };
             let column = NPath::basename(&path)?;
             match column {
@@ -296,6 +294,7 @@ impl Display {
                         id,
                     })
                 }
+                _ => None,
             }
         })
     }
@@ -312,50 +311,36 @@ impl Display {
         self.albums.clear();
         self.artists.clear();
         self.tracks.clear();
-        self.tracks.extend(
-            Self::iter_tracks(&self.db, &self.base)
-                .filter(|t| {
-                    filter
-                        .map(|f| {
-                            t.album.as_ref().map(|a| f.is_match(a)).unwrap_or(false)
-                                || t.artist
-                                    .as_ref()
-                                    .map(|a| f.is_match(a))
-                                    .unwrap_or(false)
-                                || t.genre
-                                    .as_ref()
-                                    .map(|g| f.is_match(g))
-                                    .unwrap_or(false)
-                                || t.title
-                                    .as_ref()
-                                    .map(|t| f.is_match(t))
-                                    .unwrap_or(false)
-                        })
-                        .unwrap_or(true)
-                })
-                .map(|t| {
+        let matching_tracks = Self::iter_tracks(&self.db, &self.base)
+            .filter(|t| {
+                filter
+                    .map(|f| {
+                        t.album.as_ref().map(|a| f.is_match(a)).unwrap_or(false)
+                            || t.artist.as_ref().map(|a| f.is_match(a)).unwrap_or(false)
+                            || t.genre.as_ref().map(|g| f.is_match(g)).unwrap_or(false)
+                            || t.title.as_ref().map(|t| f.is_match(t)).unwrap_or(false)
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|t| {
+                if let Some(artist) = &t.artist {
+                    let a =
+                        self.artists.entry(artist.clone()).or_insert_with(Artist::new);
+                    a.tracks.insert(t.id.clone());
+                    if let Some(album) = &t.album {
+                        a.albums.insert(album.clone());
+                    }
+                }
+                if let Some(album) = &t.album {
+                    let a = self.albums.entry(album.clone()).or_insert_with(Album::new);
+                    a.tracks.insert(t.id.clone());
                     if let Some(artist) = &t.artist {
-                        let a = self
-                            .artists
-                            .entry(artist.clone())
-                            .or_insert_with(Artist::new);
-                        a.tracks.insert(t.id.clone());
-                        if let Some(album) = &t.album {
-                            a.albums.insert(album.clone());
-                        }
+                        a.artists.insert(artist.clone());
                     }
-                    if let Some(ablum) = &t.album {
-                        let a = self
-                            .albums
-                            .entry(album.clone())
-                            .or_insert_with(HashSet::default);
-                        a.tracks.insert(t.id.clone());
-                        if let Some(artist) = &t.artist {
-                            a.artists.insert(artist.clone());
-                        }
-                    }
-                }),
-        );
+                }
+                t
+            });
+        self.tracks.extend(matching_tracks);
     }
 
     async fn update(
@@ -366,7 +351,7 @@ impl Display {
     ) -> Result<()> {
         let mut txn = Txn::new();
         if let Some(filter) = filter {
-            self.filter(filter);
+            self.apply_filter(filter);
         }
         self.clear_prefix(&mut txn, self.artists_path.clone())?;
         self.clear_prefix(&mut txn, self.albums_path.clone())?;
@@ -377,10 +362,15 @@ impl Display {
         }
         let albums = self
             .albums
-            .keys()
-            .filter(|album| {
-                selected_artists.is_empty()
-                    || selected_artists.iter().any(|a| album.artists.contains(a))
+            .iter()
+            .filter_map(|(name, album)| {
+                let is_match = selected_artists.is_empty()
+                    || selected_artists.iter().any(|a| album.artists.contains(a));
+                if is_match {
+                    Some(name)
+                } else {
+                    None
+                }
             })
             .enumerate();
         for (i, album) in albums {
@@ -408,21 +398,80 @@ impl Display {
             .enumerate();
         for (i, track) in tracks {
             let base = self.tracks_path.append(&format!("{:0w$}", i, w = self.width));
-            let title = track.title.cloned().map(Value::String).unwrap_or(Value::Null);
+            let title = track
+                .title
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null);
             txn.set_data(true, base.append("title"), title, None);
-            let artist = track.artist.cloned().map(Value::String).unwrap_or(Value::Null);
+            let artist = track
+                .artist
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null);
             txn.set_data(true, base.append("artist"), artist, None);
-            let genre = track.genre.cloned().map(Value::String).unwrap_or(Value::Null);
+            let genre = track
+                .genre
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null);
             txn.set_data(true, base.append("genre"), genre, None);
-            let album = track.album.cloned().map(Value::String).unwrap_or(Value::Null);
+            let album = track
+                .album
+                .as_ref()
+                .map(|v| Value::String(v.clone()))
+                .unwrap_or(Value::Null);
             txn.set_data(true, base.append("album"), album, None);
-            let id = Value::String(Chars::from(&*track.id));
+            let id = Value::String(Chars::from(String::from(&*track.id)));
             txn.set_data(true, base.append("id"), id, None);
         }
         Ok(())
     }
 
-    async fn run(mut self) {}
+    async fn run(mut self) {
+        let (w_tx, mut w_rx) = mpsc::channel(3);
+        self.publisher.writes(self.selected_albums.id(), w_tx.clone());
+        self.publisher.writes(self.selected_artists.id(), w_tx.clone());
+        self.publisher.writes(self.filter.id(), w_tx);
+        let mut selected_artists: FxHashSet<Chars> = HashSet::default();
+        let mut selected_albums: FxHashSet<Chars> = HashSet::default();
+        let mut filter: Option<Regex> = None;
+        while let Some(mut batch) = w_rx.next().await {
+            let mut filter_changed = false;
+            for req in batch.drain(..) {
+                match req.id {
+                    id if id == self.selected_albums.id() => {
+                        selected_albums.clear();
+                        if let Ok(set) = req.value.cast_to::<Vec<Chars>>() {
+                            selected_albums.extend(set);
+                        }
+                    }
+                    id if id == self.selected_artists.id() => {
+                        selected_artists.clear();
+                        if let Ok(set) = req.value.cast_to::<Vec<Chars>>() {
+                            selected_artists.extend(set);
+                        }
+                    }
+                    id if id == self.filter.id() => {
+                        filter_changed = true;
+                        if let Ok(txt) = req.value.cast_to::<Chars>() {
+                            if txt.trim() == "" {
+                                filter = None;
+                            } else if let Ok(r) = Regex::new(&*txt) {
+                                filter = Some(r);
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            let filter = if filter_changed { Some(filter.as_ref()) } else { None };
+            if let Err(e) = self.update(&selected_artists, &selected_albums, filter).await
+            {
+                error!("update display failed {}", e)
+            }
+        }
+    }
 
     async fn new(
         base: NPath,
@@ -438,8 +487,8 @@ impl Display {
         let artists_path = base.append("artists");
         let albums_path = base.append("albums");
         let tracks_path = base.append("filtered-tracks");
-        let n = (db.prefix_len(&*base.append("tracks")) as f32) / 5.;
-        let width = 1 + n.log10() as u32;
+        let n = (db.prefix_len(&base.append("tracks")) as f32) / 5.;
+        let width = 1 + n.log10() as usize;
         let n = n as usize;
         let mut txn = Txn::new();
         let rows = (0..n)
@@ -458,8 +507,8 @@ impl Display {
         txn.create_sheet(artists_path.clone(), n, 1, n, 1, true, None);
         container.commit(txn).await?;
         let mut t = Self {
-            artists,
-            albums,
+            artists: HashMap::default(),
+            albums: HashMap::default(),
             tracks: Vec::new(),
             selected_artists,
             selected_albums,
@@ -678,8 +727,10 @@ async fn main() -> Result<()> {
     let container = Container::start(config, desired_auth, args.container_config).await?;
     let publisher = container.publisher().await?;
     let db = container.db().await?;
-    init_library(&args.library_path, base, &container).await?;
+    init_library(&args.library_path, base.clone(), &container).await?;
     let player = Player::new();
-    let _rpcs = RpcApi::new(api_path, &publisher, player, db)?;
-    Ok(future::pending().await) // don't quit until we are killed
+    let _rpcs = RpcApi::new(api_path, &publisher, player, db.clone())?;
+    let display = Display::new(base, db, container, publisher).await?;
+    display.run().await;
+    Ok(())
 }
