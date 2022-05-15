@@ -361,8 +361,8 @@ impl Display {
         self.clear_prefix(&mut txn, self.tracks_path.clone())?;
         let mut visible_artists = Vec::new();
         for (i, artist) in self.artists.keys().enumerate() {
-            let artist_nr = format!("{:0w$}/0", i, w = self.width);
-            let path = self.artists_path.append(&artist_nr);
+            let artist_nr = format!("{:0w$}", i, w = self.width);
+            let path = self.artists_path.append(&artist_nr).append("0");
             visible_artists.push(Value::from(artist_nr));
             txn.set_data(true, path, Value::String(artist.clone()), None);
         }
@@ -381,8 +381,8 @@ impl Display {
             .enumerate();
         let mut visible_albums = Vec::new();
         for (i, album) in albums {
-            let album_nr = format!("{:0w$}/0", i, w = self.width);
-            let path = self.albums_path.append(&album_nr);
+            let album_nr = format!("{:0w$}", i, w = self.width);
+            let path = self.albums_path.append(&album_nr).append("0");
             visible_albums.push(Value::from(album_nr));
             txn.set_data(true, path, Value::String(album.clone()), None);
         }
