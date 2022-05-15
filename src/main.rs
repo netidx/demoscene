@@ -14,6 +14,8 @@ use netidx::{
 use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
 use netidx_protocols::rpc::server as rpc;
 use netidx_tools::ClientParams;
+use regex::Regex;
+use sled::IVec;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
@@ -208,14 +210,40 @@ impl RpcApi {
     }
 }
 
+struct Track {
+    album: Option<Chars>,
+    artist: Option<Chars>,
+    genre: Option<Chars>,
+    title: Option<Chars>,
+    id: NPath,
+}
+
 struct Artist {
     tracks: FxHashSet<NPath>,
-    albums: FxHashSet<String>,
+    albums: FxHashSet<Chars>,
+}
+
+impl Artist {
+    fn new() -> Self {
+        Self { tracks: HashSet::default(), albums: HashSet::default() }
+    }
+}
+
+struct Album {
+    tracks: FxHashSet<NPath>,
+    artists: FxHashSet<Chars>,
+}
+
+impl Album {
+    fn new() -> Self {
+        Self { tracks: HashSet::default(), artists: HashSet::default() }
+    }
 }
 
 struct Display {
-    artists: FxHashMap<String, Artist>,
-    albums: FxHashMap<String, FxHashSet<NPath>>,
+    artists: FxHashMap<Chars, Artist>,
+    albums: FxHashMap<Chars, Album>,
+    tracks: Vec<Track>,
     selected_artists: Val,
     selected_albums: Val,
     filter: Val,
@@ -226,29 +254,171 @@ struct Display {
     artists_path: NPath,
     albums_path: NPath,
     tracks_path: NPath,
+    width: u32,
 }
 
 impl Display {
-    fn clear_prefix(&self, txn: &mut Txn, prefix: &NPath) -> Result<()> {
-        for r in self.db.iter_prefix(&**prefix) {
+    fn iter_tracks(db: Db, base: &NPath) -> impl Iterator<Item = Track> {
+        let mut album = None;
+        let mut artist = None;
+        let mut genre = None;
+        db.iter_prefix(base.append("tracks")).filter_map(move |r| {
+            let (path, _, data) = r.ok()?;
+            let decode = || -> Option<Chars> {
+                match <Datum as Pack>::decode(&mut &*data) {
+                    Err(_) | Ok(Datum::Deleted | Datum::Formula(_, _)) => None,
+                    Ok(Datum::Data(Value::String(s))) => Some(s),
+                    Ok(Datum::Data(_)) => None,
+                }
+            };
+            let column = NPath::basename(&path)?;
+            match column {
+                "album" => {
+                    album = decode();
+                    None
+                }
+                "artist" => {
+                    artist = decode();
+                    None
+                }
+                "file" => None,
+                "genre" => {
+                    genre = decode();
+                    None
+                }
+                "title" => {
+                    let id = NPath::from(ArcStr::from(NPath::dirname(&path)?));
+                    Some(Track {
+                        album: album.take(),
+                        artist: artist.take(),
+                        genre: genre.take(),
+                        title: decode(),
+                        id,
+                    })
+                }
+            }
+        })
+    }
+
+    fn clear_prefix(&self, txn: &mut Txn, prefix: NPath) -> Result<()> {
+        for r in self.db.iter_prefix(prefix) {
             let (path, _, _) = r?;
             txn.set_data(true, path, Value::Null, None);
         }
         Ok(())
     }
 
+    fn apply_filter(&mut self, filter: Option<&Regex>) {
+        self.albums.clear();
+        self.artists.clear();
+        self.tracks.clear();
+        self.tracks.extend(
+            Self::iter_tracks(&self.db, &self.base)
+                .filter(|t| {
+                    filter
+                        .map(|f| {
+                            t.album.as_ref().map(|a| f.is_match(a)).unwrap_or(false)
+                                || t.artist
+                                    .as_ref()
+                                    .map(|a| f.is_match(a))
+                                    .unwrap_or(false)
+                                || t.genre
+                                    .as_ref()
+                                    .map(|g| f.is_match(g))
+                                    .unwrap_or(false)
+                                || t.title
+                                    .as_ref()
+                                    .map(|t| f.is_match(t))
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|t| {
+                    if let Some(artist) = &t.artist {
+                        let a = self
+                            .artists
+                            .entry(artist.clone())
+                            .or_insert_with(Artist::new);
+                        a.tracks.insert(t.id.clone());
+                        if let Some(album) = &t.album {
+                            a.albums.insert(album.clone());
+                        }
+                    }
+                    if let Some(ablum) = &t.album {
+                        let a = self
+                            .albums
+                            .entry(album.clone())
+                            .or_insert_with(HashSet::default);
+                        a.tracks.insert(t.id.clone());
+                        if let Some(artist) = &t.artist {
+                            a.artists.insert(artist.clone());
+                        }
+                    }
+                }),
+        );
+    }
+
     async fn update(
         &mut self,
-        selected_artists: &FxHashSet<String>,
-        selected_albums: &FxHashSet<String>,
-        filter: &Option<String>,
+        selected_artists: &FxHashSet<Chars>,
+        selected_albums: &FxHashSet<Chars>,
+        filter: Option<Option<&Regex>>,
     ) -> Result<()> {
         let mut txn = Txn::new();
-        self.clear_prefix(&mut txn, &self.artists_path)?;
-        self.clear_prefix(&mut txn, &self.albums_path)?;
-        self.clear_prefix(&mut txn, &self.tracks_path)?;
-        self.container.commit(txn).await?;
-
+        if let Some(filter) = filter {
+            self.filter(filter);
+        }
+        self.clear_prefix(&mut txn, self.artists_path.clone())?;
+        self.clear_prefix(&mut txn, self.albums_path.clone())?;
+        self.clear_prefix(&mut txn, self.tracks_path.clone())?;
+        for (i, artist) in self.artists.keys().enumerate() {
+            let path = self.artists_path.append(&format!("{:0w$}/0", i, w = self.width));
+            txn.set_data(true, path, Value::String(artist.clone()), None);
+        }
+        let albums = self
+            .albums
+            .keys()
+            .filter(|album| {
+                selected_artists.is_empty()
+                    || selected_artists.iter().any(|a| album.artists.contains(a))
+            })
+            .enumerate();
+        for (i, album) in albums {
+            let path = self.albums_path.append(&format!("{:0w$}/0", i, w = self.width));
+            txn.set_data(true, path, Value::String(album.clone()), None);
+        }
+        let tracks = self
+            .tracks
+            .iter()
+            .filter(|track| {
+                let matched_album = selected_albums.is_empty()
+                    || track
+                        .album
+                        .as_ref()
+                        .map(|a| selected_albums.contains(a))
+                        .unwrap_or(false);
+                let matched_artist = selected_artists.is_empty()
+                    || track
+                        .artist
+                        .as_ref()
+                        .map(|a| selected_artists.contains(a))
+                        .unwrap_or(false);
+                matched_album && matched_artist
+            })
+            .enumerate();
+        for (i, track) in tracks {
+            let base = self.tracks_path.append(&format!("{:0w$}", i, w = self.width));
+            let title = track.title.cloned().map(Value::String).unwrap_or(Value::Null);
+            txn.set_data(true, base.append("title"), title, None);
+            let artist = track.artist.cloned().map(Value::String).unwrap_or(Value::Null);
+            txn.set_data(true, base.append("artist"), artist, None);
+            let genre = track.genre.cloned().map(Value::String).unwrap_or(Value::Null);
+            txn.set_data(true, base.append("genre"), genre, None);
+            let album = track.album.cloned().map(Value::String).unwrap_or(Value::Null);
+            txn.set_data(true, base.append("album"), album, None);
+            let id = Value::String(Chars::from(&*track.id));
+            txn.set_data(true, base.append("id"), id, None);
+        }
         Ok(())
     }
 
@@ -268,68 +438,29 @@ impl Display {
         let artists_path = base.append("artists");
         let albums_path = base.append("albums");
         let tracks_path = base.append("filtered-tracks");
-        let mut artists = HashMap::default();
-        let mut albums = HashMap::default();
-        let mut n = 0;
-        let mut current_album = None;
-        for r in db.iter_prefix(&*base.append("tracks")) {
-            let (path, _, data) = r?;
-            let column =
-                NPath::basename(&path).ok_or_else(|| anyhow!("column missing"))?;
-            let track = NPath::dirname(&path).ok_or_else(|| anyhow!("missing id"))?;
-            let track = NPath::from(ArcStr::from(track));
-            let decode = || -> Result<Option<String>> {
-                match <Datum as Pack>::decode(&mut &*data)? {
-                    Datum::Deleted | Datum::Formula(_, _) => Ok(None),
-                    Datum::Data(Value::String(s)) => Ok(Some(String::from(s.trim()))),
-                    Datum::Data(_) => Ok(None),
-                }
-            };
-            match column {
-                "album" => {
-                    if let Some(album) = decode()? {
-                        current_album = Some(album.clone());
-                        albums
-                            .entry(album)
-                            .or_insert_with(|| HashSet::default())
-                            .insert(track);
-                    }
-                }
-                "artist" => {
-                    if let Some(artist) = decode()? {
-                        n += 1;
-                        let artist = artists.entry(artist).or_insert_with(|| Artist {
-                            tracks: HashSet::default(),
-                            albums: HashSet::default(),
-                        });
-                        artist.tracks.insert(track);
-                        if let Some(album) = current_album.take() {
-                            artist.albums.insert(album);
-                        }
-                    }
-                }
-                _ => (),
-            }
-        }
+        let n = (db.prefix_len(&*base.append("tracks")) as f32) / 5.;
+        let width = 1 + n.log10() as u32;
+        let n = n as usize;
         let mut txn = Txn::new();
-        let row_width = 1 + (n as f32).log10() as usize;
         let rows = (0..n)
             .into_iter()
-            .map(|i| Chars::from(format!("{:0width$}", i, width = row_width)))
+            .map(|i| Chars::from(format!("{:0w$}", i, w = width)))
             .collect::<Vec<_>>();
         let cols = vec![
             Chars::from("title"),
             Chars::from("album"),
             Chars::from("artist"),
             Chars::from("genre"),
+            Chars::from("id"),
         ];
-        txn.create_table(artists_path.clone(), rows, cols, true, None);
-        let l = albums.len();
-        txn.create_sheet(albums_path.clone(), l, 1, l, 1, true, None);
-        txn.create_sheet(tracks_path.clone(), n, 4, n, 4, true, None);
-        Ok(Self {
+        txn.create_table(tracks_path.clone(), rows, cols, true, None);
+        txn.create_sheet(albums_path.clone(), n, 1, n, 1, true, None);
+        txn.create_sheet(artists_path.clone(), n, 1, n, 1, true, None);
+        container.commit(txn).await?;
+        let mut t = Self {
             artists,
             albums,
+            tracks: Vec::new(),
             selected_artists,
             selected_albums,
             filter,
@@ -340,7 +471,10 @@ impl Display {
             artists_path,
             albums_path,
             tracks_path,
-        })
+            width,
+        };
+        t.update(&HashSet::default(), &HashSet::default(), Some(None)).await?;
+        Ok(t)
     }
 }
 

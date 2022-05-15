@@ -15,8 +15,8 @@ lto = "thin"
 debug = 1
 
 [dependencies]
-arcstr = "1"
 anyhow = "1"
+arcstr = "1"
 env_logger = "0.9"
 futures = "0.3"
 fxhash = "0.2"
@@ -31,6 +31,8 @@ netidx-protocols = { version = "0.10", path = "../netidx/netidx-protocols" }
 netidx-tools = { version = "0.10", path = "../netidx/netidx-tools" }
 netidx = { version = "0.10", path = "../netidx/netidx" }
 rayon = "1"
+regex = "1"
 sled = { version = "0.34", features = ["zstd", "compression"] }
 structopt = "0.3"
 tokio = { version = "1", features = ["full"] }
+sled = "0.34"
