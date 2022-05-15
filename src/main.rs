@@ -246,6 +246,9 @@ struct Display {
     selected_artists: Val,
     selected_albums: Val,
     filter: Val,
+    artists_filter: Val,
+    albums_filter: Val,
+    tracks_filter: Val,
     db: Db,
     container: Container,
     publisher: Publisher,
@@ -356,8 +359,11 @@ impl Display {
         self.clear_prefix(&mut txn, self.artists_path.clone())?;
         self.clear_prefix(&mut txn, self.albums_path.clone())?;
         self.clear_prefix(&mut txn, self.tracks_path.clone())?;
+        let mut visible_artists = Vec::new();
         for (i, artist) in self.artists.keys().enumerate() {
-            let path = self.artists_path.append(&format!("{:0w$}/0", i, w = self.width));
+            let artist_nr = format!("{:0w$}/0", i, w = self.width);
+            let path = self.artists_path.append(&artist_nr);
+            visible_artists.push(Value::from(artist_nr));
             txn.set_data(true, path, Value::String(artist.clone()), None);
         }
         let albums = self
@@ -373,8 +379,11 @@ impl Display {
                 }
             })
             .enumerate();
+        let mut visible_albums = Vec::new();
         for (i, album) in albums {
-            let path = self.albums_path.append(&format!("{:0w$}/0", i, w = self.width));
+            let album_nr = format!("{:0w$}/0", i, w = self.width);
+            let path = self.albums_path.append(&album_nr);
+            visible_albums.push(Value::from(album_nr));
             txn.set_data(true, path, Value::String(album.clone()), None);
         }
         let tracks = self
@@ -396,8 +405,11 @@ impl Display {
                 matched_album && matched_artist
             })
             .enumerate();
+        let mut visible_tracks = Vec::new();
         for (i, track) in tracks {
-            let base = self.tracks_path.append(&format!("{:0w$}", i, w = self.width));
+            let track_nr = format!("{:0w$}", i, w = self.width);
+            let base = self.tracks_path.append(&track_nr);
+            visible_tracks.push(Value::from(track_nr));
             let title = track
                 .title
                 .as_ref()
@@ -425,7 +437,21 @@ impl Display {
             let id = Value::String(Chars::from(String::from(&*track.id)));
             txn.set_data(true, base.append("id"), id, None);
         }
-        self.container.commit(txn).await
+        let mut batch = self.publisher.start_batch();
+        self.tracks_filter.update(
+            &mut batch,
+            Value::from(vec![Value::from("include"), Value::from(visible_tracks)]),
+        );
+        self.albums_filter.update(
+            &mut batch,
+            Value::from(vec![Value::from("include"), Value::from(visible_albums)]),
+        );
+        self.artists_filter.update(
+            &mut batch,
+            Value::from(vec![Value::from("include"), Value::from(visible_artists)]),
+        );
+        self.container.commit(txn).await?;
+        Ok(batch.commit(None).await)
     }
 
     async fn run(mut self) {
@@ -484,6 +510,12 @@ impl Display {
             publisher.publish(base.append("selected-albums"), Value::Null)?;
         let selected_artists =
             publisher.publish(base.append("selected-artists"), Value::Null)?;
+        let tracks_filter =
+            publisher.publish(base.append("tracks-filter"), Value::Null)?;
+        let artists_filter =
+            publisher.publish(base.append("artists-filter"), Value::Null)?;
+        let albums_filter =
+            publisher.publish(base.append("albums-filter"), Value::Null)?;
         let artists_path = base.append("artists");
         let albums_path = base.append("albums");
         let tracks_path = base.append("filtered-tracks");
@@ -510,6 +542,9 @@ impl Display {
             artists: HashMap::default(),
             albums: HashMap::default(),
             tracks: Vec::new(),
+            tracks_filter,
+            albums_filter,
+            artists_filter,
             selected_artists,
             selected_albums,
             filter,
