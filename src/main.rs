@@ -3,12 +3,12 @@ use arcstr::ArcStr;
 use futures::{channel::mpsc, StreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use gstreamer::prelude::*;
-use log::{error, info};
+use log::{error, info, warn};
 use netidx::{
     chars::Chars,
     pack::Pack,
     path::Path as NPath,
-    publisher::{Publisher, Val, Value},
+    publisher::{Publisher, UpdateBatch, Val, Value},
     utils::pack,
 };
 use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
@@ -346,12 +346,12 @@ impl Display {
         self.tracks.extend(matching_tracks);
     }
 
-    async fn update(
+    fn update(
         &mut self,
         selected_artists: &FxHashSet<Chars>,
         selected_albums: &FxHashSet<Chars>,
         filter: Option<Option<&Regex>>,
-    ) -> Result<()> {
+    ) -> Result<(Txn, UpdateBatch)> {
         let mut txn = Txn::new();
         if let Some(filter) = filter {
             self.apply_filter(filter);
@@ -450,8 +450,7 @@ impl Display {
             &mut batch,
             Value::from(vec![Value::from("include"), Value::from(visible_artists)]),
         );
-        self.container.commit(txn).await?;
-        Ok(batch.commit(None).await)
+        Ok((txn, batch))
     }
 
     async fn run(mut self) {
@@ -488,13 +487,24 @@ impl Display {
                             }
                         }
                     }
-                    _ => (),
+                    id => warn!("unknown write id {:?}", id),
                 }
             }
             let filter = if filter_changed { Some(filter.as_ref()) } else { None };
-            if let Err(e) = self.update(&selected_artists, &selected_albums, filter).await
-            {
-                error!("update display failed {}", e)
+            let r = block_in_place(|| {
+                self.update(&selected_artists, &selected_albums, filter)
+            });
+            match r {
+                Ok((txn, batch)) => {
+                    batch.commit(None).await;
+                    if let Err(e) = self.container.commit(txn).await {
+                        error!("txn commit failed {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("update display failed {}", e)
+                }
             }
         }
     }
@@ -557,7 +567,11 @@ impl Display {
             tracks_path,
             width,
         };
-        t.update(&HashSet::default(), &HashSet::default(), Some(None)).await?;
+        let (txn, batch) = block_in_place(|| {
+            t.update(&HashSet::default(), &HashSet::default(), Some(None))
+        })?;
+        batch.commit(None).await;
+        t.container.commit(txn).await?;
         Ok(t)
     }
 }
@@ -765,7 +779,6 @@ async fn main() -> Result<()> {
     init_library(&args.library_path, base.clone(), &container).await?;
     let player = Player::new();
     let _rpcs = RpcApi::new(api_path, &publisher, player, db.clone())?;
-    let display = Display::new(base, db, container, publisher).await?;
-    display.run().await;
+    Display::new(base, db, container, publisher).await?.run().await;
     Ok(())
 }
