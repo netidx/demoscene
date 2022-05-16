@@ -3,7 +3,7 @@ use arcstr::ArcStr;
 use futures::{channel::mpsc, StreamExt};
 use fxhash::{FxHashMap, FxHashSet};
 use gstreamer::prelude::*;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use netidx::{
     chars::Chars,
     pack::Pack,
@@ -22,7 +22,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
 use tokio::task::block_in_place;
@@ -355,11 +355,11 @@ impl Display {
     ) -> Result<Txn> {
         let mut txn = Txn::new();
         if let Some(filter) = filter {
+            debug!("Display::update: applying filter {:?}", filter);
+            let ts = Instant::now();
             self.apply_filter(filter);
+            debug!("Display::update: applied filter in {}s", ts.elapsed().as_secs_f32());
         }
-        self.clear_prefix(&mut txn, self.artists_path.clone())?;
-        self.clear_prefix(&mut txn, self.albums_path.clone())?;
-        self.clear_prefix(&mut txn, self.tracks_path.clone())?;
         let mut visible_artists = Vec::new();
         for (i, artist) in self.artists.keys().enumerate() {
             let artist_nr = format!("{:0w$}", i, w = self.width);
@@ -367,6 +367,7 @@ impl Display {
             visible_artists.push(Value::from(artist_nr));
             txn.set_data(true, path, Value::String(artist.clone()), None);
         }
+        debug!("Display::update: {} visible artists", visible_artists.len());
         let albums = self
             .albums
             .iter()
@@ -387,6 +388,7 @@ impl Display {
             visible_albums.push(Value::from(album_nr));
             txn.set_data(true, path, Value::String(album.clone()), None);
         }
+        debug!("Display::update: {} visible albums", visible_albums.len());
         let tracks = self
             .tracks
             .iter()
@@ -438,6 +440,7 @@ impl Display {
             let id = Value::String(Chars::from(String::from(&*track.id)));
             txn.set_data(true, base.append("id"), id, None);
         }
+        debug!("Display::update: {} visible tracks", visible_tracks.len());
         let v = Value::from(vec![Value::from("include"), Value::from(visible_tracks)]);
         self.tracks_filter.update(batch, v);
         let v = Value::from(vec![Value::from("include"), Value::from(visible_albums)]);
@@ -457,7 +460,6 @@ impl Display {
         let mut filter: Option<Regex> = None;
         while let Some(mut batch) = w_rx.next().await {
             let mut filter_changed = false;
-            let mut update_required = false;
             let mut updates = self.publisher.start_batch();
             for req in batch.drain(..) {
                 match req.id {
@@ -465,7 +467,6 @@ impl Display {
                         selected_albums.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
-                                update_required = true;
                                 self.selected_albums.update(&mut updates, req.value);
                                 selected_albums.extend(set);
                             }
@@ -481,7 +482,6 @@ impl Display {
                         selected_artists.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
-                                update_required = true;
                                 self.selected_artists.update(&mut updates, req.value);
                                 selected_artists.extend(set);
                             }
@@ -496,14 +496,13 @@ impl Display {
                     id if id == self.filter.id() => {
                         match req.value.clone().cast_to::<Chars>().and_then(|s| {
                             if s.trim() == "" {
-                                Ok(Some(Regex::new(&*s)?))
-                            } else {
                                 Ok(None)
+                            } else {
+                                Ok(Some(Regex::new(&*s)?))
                             }
                         }) {
                             Ok(re) => {
                                 filter_changed = true;
-                                update_required = true;
                                 self.filter.update(&mut updates, req.value);
                                 filter = re;
                             }
@@ -516,24 +515,25 @@ impl Display {
                     id => warn!("unknown write id {:?}", id),
                 }
             }
-            if update_required {
-                let filter = if filter_changed { Some(filter.as_ref()) } else { None };
-                let r = block_in_place(|| {
-                    self.update(&mut updates, &selected_artists, &selected_albums, filter)
-                });
-                match r {
-                    Ok(txn) => {
-                        if let Err(e) = self.container.commit(txn).await {
-                            error!("txn commit failed {}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("update display failed {}", e)
+            let filter = if filter_changed { Some(filter.as_ref()) } else { None };
+            let ts = Instant::now();
+            debug!("Display::run: starting update");
+            let r = block_in_place(|| {
+                self.update(&mut updates, &selected_artists, &selected_albums, filter)
+            });
+            debug!("Display::run: finished update in {}s", ts.elapsed().as_secs_f32());
+            updates.commit(None).await;
+            match r {
+                Ok(txn) => {
+                    if let Err(e) = self.container.commit(txn).await {
+                        error!("txn commit failed {}", e);
+                        break;
                     }
                 }
+                Err(e) => {
+                    error!("update display failed {}", e)
+                }
             }
-            updates.commit(None).await;
         }
     }
 
