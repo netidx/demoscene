@@ -1,0 +1,67 @@
+{
+  "variables": {},
+  "keybinds": [],
+  "root": {
+    "props": null,
+    "kind": {
+      "Paned": {
+        "direction": "Vertical",
+        "wide_handle": false,
+        "first_child": {
+          "props": null,
+          "kind": {
+            "Paned": {
+              "direction": "Horizontal",
+              "wide_handle": false,
+              "first_child": {
+                "props": null,
+                "kind": {
+                  "Table": {
+                    "path": "\"/local/music/artists\"",
+                    "default_sort_column": "null",
+                    "column_filter": "null",
+                    "row_filter": "load(\"/local/music/artists-filter\")",
+                    "column_editable": "false",
+                    "on_select": "null",
+                    "on_activate": "null",
+                    "on_edit": "null"
+                  }
+                }
+              },
+              "second_child": {
+                "props": null,
+                "kind": {
+                  "Table": {
+                    "path": "\"/local/music/albums\"",
+                    "default_sort_column": "null",
+                    "column_filter": "null",
+                    "row_filter": "load(\"/local/music/albums-filter\")",
+                    "column_editable": "false",
+                    "on_select": "null",
+                    "on_activate": "null",
+                    "on_edit": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "second_child": {
+          "props": null,
+          "kind": {
+            "Table": {
+              "path": "\"/local/music/filtered-tracks\"",
+              "default_sort_column": "null",
+              "column_filter": "[\"include\", [\"title\", \"album\", \"artist\", \"genre\"]]",
+              "row_filter": "load(\"/local/music/tracks-filter\")",
+              "column_editable": "false",
+              "on_select": "null",
+              "on_activate": "null",
+              "on_edit": "null"
+            }
+          }
+        }
+      }
+    }
+  }
+}

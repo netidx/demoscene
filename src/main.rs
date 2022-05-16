@@ -457,6 +457,7 @@ impl Display {
         let mut filter: Option<Regex> = None;
         while let Some(mut batch) = w_rx.next().await {
             let mut filter_changed = false;
+            let mut update_required = false;
             let mut updates = self.publisher.start_batch();
             for req in batch.drain(..) {
                 match req.id {
@@ -464,6 +465,7 @@ impl Display {
                         selected_albums.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
+                                update_required = true;
                                 self.selected_albums.update(&mut updates, req.value);
                                 selected_albums.extend(set);
                             }
@@ -479,6 +481,7 @@ impl Display {
                         selected_artists.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
+                                update_required = true;
                                 self.selected_artists.update(&mut updates, req.value);
                                 selected_artists.extend(set);
                             }
@@ -491,35 +494,46 @@ impl Display {
                         }
                     }
                     id if id == self.filter.id() => {
-                        filter_changed = true;
-                        if let Ok(txt) = req.value.clone().cast_to::<Chars>() {
-                            self.filter.update(&mut updates, req.value);
-                            if txt.trim() == "" {
-                                filter = None;
-                            } else if let Ok(r) = Regex::new(&*txt) {
-                                filter = Some(r);
+                        match req.value.clone().cast_to::<Chars>().and_then(|s| {
+                            if s.trim() == "" {
+                                Ok(Some(Regex::new(&*s)?))
+                            } else {
+                                Ok(None)
+                            }
+                        }) {
+                            Ok(re) => {
+                                filter_changed = true;
+                                update_required = true;
+                                self.filter.update(&mut updates, req.value);
+                                filter = re;
+                            }
+                            Err(_) => {
+                                let e = Value::Error(Chars::from("expected a regex"));
+                                self.filter.update(&mut updates, e);
                             }
                         }
                     }
                     id => warn!("unknown write id {:?}", id),
                 }
             }
-            let filter = if filter_changed { Some(filter.as_ref()) } else { None };
-            let r = block_in_place(|| {
-                self.update(&mut updates, &selected_artists, &selected_albums, filter)
-            });
-            match r {
-                Ok(txn) => {
-                    updates.commit(None).await;
-                    if let Err(e) = self.container.commit(txn).await {
-                        error!("txn commit failed {}", e);
-                        break;
+            if update_required {
+                let filter = if filter_changed { Some(filter.as_ref()) } else { None };
+                let r = block_in_place(|| {
+                    self.update(&mut updates, &selected_artists, &selected_albums, filter)
+                });
+                match r {
+                    Ok(txn) => {
+                        if let Err(e) = self.container.commit(txn).await {
+                            error!("txn commit failed {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("update display failed {}", e)
                     }
                 }
-                Err(e) => {
-                    error!("update display failed {}", e)
-                }
             }
+            updates.commit(None).await;
         }
     }
 
