@@ -442,11 +442,11 @@ impl Display {
         }
         debug!("Display::update: {} visible tracks", visible_tracks.len());
         let v = Value::from(vec![Value::from("include"), Value::from(visible_tracks)]);
-        self.tracks_filter.update(batch, v);
+        self.tracks_filter.update_changed(batch, v);
         let v = Value::from(vec![Value::from("include"), Value::from(visible_albums)]);
-        self.albums_filter.update(batch, v);
+        self.albums_filter.update_changed(batch, v);
         let v = Value::from(vec![Value::from("include"), Value::from(visible_artists)]);
-        self.artists_filter.update(batch, v);
+        self.artists_filter.update_changed(batch, v);
         Ok(txn)
     }
 
