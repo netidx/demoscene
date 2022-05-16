@@ -467,14 +467,14 @@ impl Display {
                         selected_albums.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
-                                self.selected_albums.update(&mut updates, req.value);
+                                self.selected_albums.update_changed(&mut updates, req.value);
                                 selected_albums.extend(set);
                             }
                             Err(_) => {
                                 let e = Value::Error(Chars::from(
                                     "expected a list of albums",
                                 ));
-                                self.selected_albums.update(&mut updates, e);
+                                self.selected_albums.update_changed(&mut updates, e);
                             }
                         }
                     }
@@ -482,14 +482,14 @@ impl Display {
                         selected_artists.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
-                                self.selected_artists.update(&mut updates, req.value);
+                                self.selected_artists.update_changed(&mut updates, req.value);
                                 selected_artists.extend(set);
                             }
                             Err(_) => {
                                 let e = Value::Error(Chars::from(
                                     "expected a list of artists",
                                 ));
-                                self.selected_artists.update(&mut updates, e);
+                                self.selected_artists.update_changed(&mut updates, e);
                             }
                         }
                     }
@@ -503,12 +503,12 @@ impl Display {
                         }) {
                             Ok(re) => {
                                 filter_changed = true;
-                                self.filter.update(&mut updates, req.value);
+                                self.filter.update_changed(&mut updates, req.value);
                                 filter = re;
                             }
                             Err(_) => {
                                 let e = Value::Error(Chars::from("expected a regex"));
-                                self.filter.update(&mut updates, e);
+                                self.filter.update_changed(&mut updates, e);
                             }
                         }
                     }
