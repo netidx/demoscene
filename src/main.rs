@@ -348,10 +348,11 @@ impl Display {
 
     fn update(
         &mut self,
+        batch: &mut UpdateBatch,
         selected_artists: &FxHashSet<Chars>,
         selected_albums: &FxHashSet<Chars>,
         filter: Option<Option<&Regex>>,
-    ) -> Result<(Txn, UpdateBatch)> {
+    ) -> Result<Txn> {
         let mut txn = Txn::new();
         if let Some(filter) = filter {
             self.apply_filter(filter);
@@ -437,20 +438,13 @@ impl Display {
             let id = Value::String(Chars::from(String::from(&*track.id)));
             txn.set_data(true, base.append("id"), id, None);
         }
-        let mut batch = self.publisher.start_batch();
-        self.tracks_filter.update(
-            &mut batch,
-            Value::from(vec![Value::from("include"), Value::from(visible_tracks)]),
-        );
-        self.albums_filter.update(
-            &mut batch,
-            Value::from(vec![Value::from("include"), Value::from(visible_albums)]),
-        );
-        self.artists_filter.update(
-            &mut batch,
-            Value::from(vec![Value::from("include"), Value::from(visible_artists)]),
-        );
-        Ok((txn, batch))
+        let v = Value::from(vec![Value::from("include"), Value::from(visible_tracks)]);
+        self.tracks_filter.update(batch, v);
+        let v = Value::from(vec![Value::from("include"), Value::from(visible_albums)]);
+        self.albums_filter.update(batch, v);
+        let v = Value::from(vec![Value::from("include"), Value::from(visible_artists)]);
+        self.artists_filter.update(batch, v);
+        Ok(txn)
     }
 
     async fn run(mut self) {
@@ -463,23 +457,43 @@ impl Display {
         let mut filter: Option<Regex> = None;
         while let Some(mut batch) = w_rx.next().await {
             let mut filter_changed = false;
+            let mut updates = self.publisher.start_batch();
             for req in batch.drain(..) {
                 match req.id {
                     id if id == self.selected_albums.id() => {
                         selected_albums.clear();
-                        if let Ok(set) = req.value.cast_to::<Vec<Chars>>() {
-                            selected_albums.extend(set);
+                        match req.value.clone().cast_to::<Vec<Chars>>() {
+                            Ok(set) => {
+                                self.selected_albums.update(&mut updates, req.value);
+                                selected_albums.extend(set);
+                            }
+                            Err(_) => {
+                                let e = Value::Error(Chars::from(
+                                    "expected a list of albums",
+                                ));
+                                self.selected_albums.update(&mut updates, e);
+                            }
                         }
                     }
                     id if id == self.selected_artists.id() => {
                         selected_artists.clear();
-                        if let Ok(set) = req.value.cast_to::<Vec<Chars>>() {
-                            selected_artists.extend(set);
+                        match req.value.clone().cast_to::<Vec<Chars>>() {
+                            Ok(set) => {
+                                self.selected_artists.update(&mut updates, req.value);
+                                selected_artists.extend(set);
+                            }
+                            Err(_) => {
+                                let e = Value::Error(Chars::from(
+                                    "expected a list of artists",
+                                ));
+                                self.selected_artists.update(&mut updates, e);
+                            }
                         }
                     }
                     id if id == self.filter.id() => {
                         filter_changed = true;
-                        if let Ok(txt) = req.value.cast_to::<Chars>() {
+                        if let Ok(txt) = req.value.clone().cast_to::<Chars>() {
+                            self.filter.update(&mut updates, req.value);
                             if txt.trim() == "" {
                                 filter = None;
                             } else if let Ok(r) = Regex::new(&*txt) {
@@ -492,11 +506,11 @@ impl Display {
             }
             let filter = if filter_changed { Some(filter.as_ref()) } else { None };
             let r = block_in_place(|| {
-                self.update(&selected_artists, &selected_albums, filter)
+                self.update(&mut updates, &selected_artists, &selected_albums, filter)
             });
             match r {
-                Ok((txn, batch)) => {
-                    batch.commit(None).await;
+                Ok(txn) => {
+                    updates.commit(None).await;
                     if let Err(e) = self.container.commit(txn).await {
                         error!("txn commit failed {}", e);
                         break;
@@ -567,8 +581,9 @@ impl Display {
             tracks_path,
             width,
         };
-        let (txn, batch) = block_in_place(|| {
-            t.update(&HashSet::default(), &HashSet::default(), Some(None))
+        let mut batch = t.publisher.start_batch();
+        let txn = block_in_place(|| {
+            t.update(&mut batch, &HashSet::default(), &HashSet::default(), Some(None))
         })?;
         batch.commit(None).await;
         t.container.commit(txn).await?;
