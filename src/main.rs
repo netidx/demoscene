@@ -561,7 +561,7 @@ impl Display {
         container: Container,
         publisher: Publisher,
     ) -> Result<Self> {
-        let filter = publisher.publish(base.append("filter"), Value::Null)?;
+        let filter = publisher.publish(base.append("filter"), Value::from(""))?;
         let selected_albums =
             publisher.publish(base.append("selected-albums"), Value::Null)?;
         let selected_artists =
