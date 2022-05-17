@@ -513,8 +513,10 @@ impl Display {
                         match req.value.clone().cast_to::<Chars>().and_then(|s| {
                             if s.trim() == "" {
                                 Ok(None)
-                            } else {
+                            } else if s.starts_with("#") {
                                 Ok(Some(Regex::new(&*s)?))
+                            } else {
+                                Ok(Some(Regex::new(&format!("(?i).*{}.*", &*s))?))
                             }
                         }) {
                             Ok(re) => {
