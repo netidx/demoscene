@@ -513,8 +513,9 @@ impl Display {
                         match req.value.clone().cast_to::<Chars>().and_then(|s| {
                             if s.trim() == "" {
                                 Ok(None)
-                            } else if s.starts_with("#") {
-                                Ok(Some(Regex::new(&*s)?))
+                            } else if s.starts_with("#r") {
+                                let s = s.strip_prefix("#r").ok_or_else(|| anyhow!("missing prefix"))?;
+                                Ok(Some(Regex::new(s)?))
                             } else {
                                 Ok(Some(Regex::new(&format!("(?i).*{}.*", &*s))?))
                             }
