@@ -192,12 +192,14 @@ impl RpcApi {
                             _ => return Self::err("track id must be a single string"),
                         },
                     };
-                    let file = format!("{}/file", &*track);
-                    let file = match db.lookup(dbg!(&file)) {
-                        Ok(Some(Datum::Data(Value::String(f)))) => dbg!(f),
-                        Ok(Some(_)) | Ok(None) | Err(_) => {
-                            return Self::err("track not found")
-                        }
+                    let id = match db.lookup_value(&format!("{}/id", track)) {
+                        Some(Value::String(id)) => id.clone(),
+                        None | Some(_) => track,
+                    };
+                    let file = format!("{}/file", &*id);
+                    let file = match db.lookup_value(dbg!(&file)) {
+                        Some(Value::String(f)) => dbg!(f),
+                        None | Some(_) => return Self::err("track not found"),
                     };
                     match player.play(&*file) {
                         Ok(()) => Value::Ok,
@@ -302,6 +304,8 @@ impl Display {
         })
     }
 
+    // CR estokes: I'm not sure I don't need this
+    #[allow(dead_code)]
     fn clear_prefix(&self, txn: &mut Txn, prefix: NPath) -> Result<()> {
         for r in self.db.iter_prefix(prefix) {
             let (path, _, _) = r?;
@@ -467,8 +471,14 @@ impl Display {
                         selected_albums.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
-                                self.selected_albums.update_changed(&mut updates, req.value);
-                                selected_albums.extend(set);
+                                self.selected_albums
+                                    .update_changed(&mut updates, req.value);
+                                let selected = set.into_iter().filter_map(|p| {
+                                    self.db
+                                        .lookup_value(&*p)
+                                        .and_then(|v| v.cast_to::<Chars>().ok())
+                                });
+                                selected_albums.extend(selected);
                             }
                             Err(_) => {
                                 let e = Value::Error(Chars::from(
@@ -482,8 +492,14 @@ impl Display {
                         selected_artists.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
-                                self.selected_artists.update_changed(&mut updates, req.value);
-                                selected_artists.extend(set);
+                                self.selected_artists
+                                    .update_changed(&mut updates, req.value);
+                                let selected = set.into_iter().filter_map(|p| {
+                                    self.db
+                                        .lookup_value(&*p)
+                                        .and_then(|v| v.cast_to::<Chars>().ok())
+                                });
+                                selected_artists.extend(selected);
                             }
                             Err(_) => {
                                 let e = Value::Error(Chars::from(
