@@ -60,7 +60,7 @@ struct Player(Arc<PlayerInner>);
 
 impl Player {
     fn task(rx: glib::Receiver<ToPlayer>) -> Result<()> {
-        dbg!(gstreamer::init()?);
+        gstreamer::init()?;
         let main_loop = glib::MainLoop::new(None, false);
         let dispatcher = gstreamer_player::PlayerGMainContextSignalDispatcher::new(None);
         let player = gstreamer_player::Player::new(
@@ -75,7 +75,6 @@ impl Player {
             error!("player error: {}", error);
             player.stop();
         });
-        dbg!(());
         let _main_loop = main_loop.clone();
         rx.attach(None, move |m| match m {
             ToPlayer::Play(s) => {
@@ -96,9 +95,7 @@ impl Player {
                 glib::Continue(false)
             }
         });
-        dbg!(());
         main_loop.run();
-        dbg!(());
         Ok(())
     }
 
@@ -181,7 +178,6 @@ impl RpcApi {
             .into_iter()
             .collect(),
             Arc::new(move |_addr, mut args| {
-                dbg!(&args);
                 let player = player.clone();
                 let db = db.clone();
                 Box::pin(async move {
@@ -197,8 +193,8 @@ impl RpcApi {
                         None | Some(_) => track,
                     };
                     let file = format!("{}/file", &*id);
-                    let file = match db.lookup_value(dbg!(&file)) {
-                        Some(Value::String(f)) => dbg!(f),
+                    let file = match db.lookup_value(&file) {
+                        Some(Value::String(f)) => f,
                         None | Some(_) => return Self::err("track not found"),
                     };
                     match player.play(&*file) {
