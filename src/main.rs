@@ -523,12 +523,12 @@ impl Display {
             for req in batch.drain(..) {
                 match req.id {
                     id if id == self.selected_albums.id() => {
-                        selected_artists.clear();
+                        selected_albums.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
                                 self.selected_albums
                                     .update_changed(&mut updates, req.value);
-                                selected_artists.extend(
+                                selected_albums.extend(
                                     set.iter()
                                         .filter_map(|p| NPath::dirname(p))
                                         .filter_map(|p| NPath::basename(p))
@@ -543,12 +543,12 @@ impl Display {
                         }
                     }
                     id if id == self.selected_artists.id() => {
-                        selected_albums.clear();
+                        selected_artists.clear();
                         match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
                                 self.selected_artists
                                     .update_changed(&mut updates, req.value);
-                                selected_albums.extend(
+                                selected_artists.extend(
                                     set.iter()
                                         .filter_map(|p| NPath::dirname(p))
                                         .filter_map(|p| NPath::basename(p))
