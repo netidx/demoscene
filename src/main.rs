@@ -285,11 +285,15 @@ struct Track {
 
 impl Track {
     fn album_id(db: &Db, path: &NPath) -> Option<Digest> {
-        db.lookup_value(&*path.append("album")).and_then(|v| v.get_as::<Digest>())
+        db.lookup_value(&*path.append("album"))
+            .and_then(|v| v.get_as::<Chars>())
+            .map(|c| Digest::compute_from_bytes(&*c))
     }
 
     fn artist_id(db: &Db, path: &NPath) -> Option<Digest> {
-        db.lookup_value(&*path.append("artist")).and_then(|v| v.get_as::<Digest>())
+        db.lookup_value(&*path.append("artist"))
+            .and_then(|v| v.get_as::<Chars>())
+            .map(|c| Digest::compute_from_bytes(&*c))
     }
 }
 
