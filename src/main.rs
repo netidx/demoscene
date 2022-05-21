@@ -208,7 +208,7 @@ impl RpcApi {
     }
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct Digest(md5::Digest);
 
 impl Digest {
@@ -428,7 +428,9 @@ impl Display {
                 if let Some(album) = &t.album {
                     self.albums.insert(Digest::compute_from_bytes(&**album));
                 }
-                NPath::basename(&t.id).and_then(|s| Digest::from_str(s).ok())
+                NPath::dirname(&t.id)
+                    .and_then(|p| NPath::basename(p))
+                    .and_then(|s| Digest::from_str(s).ok())
             });
         self.tracks.extend(matching_tracks);
     }
@@ -468,7 +470,7 @@ impl Display {
             let visible = self
                 .tracks
                 .iter()
-                .cloned()
+                .copied()
                 .filter(|d| {
                     let path = self.tracks_path.append(&d.to_string());
                     let album = Track::album_id(&self.db, &path);
@@ -521,11 +523,17 @@ impl Display {
             for req in batch.drain(..) {
                 match req.id {
                     id if id == self.selected_albums.id() => {
-                        match req.value.clone().cast_to::<FxHashSet<Digest>>() {
+                        selected_artists.clear();
+                        match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
                                 self.selected_albums
                                     .update_changed(&mut updates, req.value);
-                                selected_albums = set;
+                                selected_artists.extend(
+                                    set.iter()
+                                        .filter_map(|p| NPath::dirname(p))
+                                        .filter_map(|p| NPath::basename(p))
+                                        .filter_map(|p| Digest::from_str(p).ok()),
+                                );
                             }
                             Err(_) => {
                                 let m = "expected a list of albums";
@@ -535,11 +543,17 @@ impl Display {
                         }
                     }
                     id if id == self.selected_artists.id() => {
-                        match req.value.clone().cast_to::<FxHashSet<Digest>>() {
+                        selected_albums.clear();
+                        match req.value.clone().cast_to::<Vec<Chars>>() {
                             Ok(set) => {
                                 self.selected_artists
                                     .update_changed(&mut updates, req.value);
-                                selected_artists = set;
+                                selected_albums.extend(
+                                    set.iter()
+                                        .filter_map(|p| NPath::dirname(p))
+                                        .filter_map(|p| NPath::basename(p))
+                                        .filter_map(|p| Digest::from_str(p).ok()),
+                                );
                             }
                             Err(_) => {
                                 let m = "expected a list of artists";
