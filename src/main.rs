@@ -495,7 +495,10 @@ impl Display {
     }
 
     fn compute_visible_tracks(&self) -> Option<Vec<Digest>> {
-        if self.selected_albums.is_empty() && self.selected_artists.is_empty() {
+        if self.selected_albums.is_empty()
+            && self.selected_artists.is_empty()
+            && self.sort_column.is_empty()
+        {
             None
         } else {
             let mut visible = self
@@ -527,8 +530,8 @@ impl Display {
                         let v0 = f(&self.db, &path_v0);
                         let v1 = f(&self.db, &path_v1);
                         match dir {
-                            SortDir::Descending => v0.cmp(&v1),
-                            SortDir::Ascending => v1.cmp(&v0),
+                            SortDir::Descending => v1.cmp(&v0),
+                            SortDir::Ascending => v0.cmp(&v1),
                         }
                     };
                     for (col, dir) in &self.sort_column {
