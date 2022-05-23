@@ -1,14 +1,15 @@
 use anyhow::{anyhow, bail, Result};
 use futures::{channel::mpsc, StreamExt};
-use fxhash::{FxHashMap, FxHashSet};
+use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use gstreamer::prelude::*;
+use indexmap::IndexMap;
 use log::{debug, error, info, warn};
 use netidx::{
     chars::Chars,
     pack::Pack,
     path::Path as NPath,
     protocol::value::{FromValue, Typ},
-    publisher::{Publisher, UpdateBatch, Val, Value},
+    publisher::{Publisher, UpdateBatch, Val, Value, WriteRequest},
     utils::pack,
 };
 use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
@@ -16,6 +17,7 @@ use netidx_protocols::rpc::server as rpc;
 use netidx_tools::ClientParams;
 use regex::Regex;
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     convert::Into,
     fs::{self, File},
@@ -284,16 +286,28 @@ struct Track {
 }
 
 impl Track {
+    fn load_title(db: &Db, path: &NPath) -> Option<Chars> {
+        db.lookup_value(&*path.append("title")).and_then(|v| v.get_as::<Chars>())
+    }
+
+    fn load_album(db: &Db, path: &NPath) -> Option<Chars> {
+        db.lookup_value(&*path.append("album")).and_then(|v| v.get_as::<Chars>())
+    }
+
     fn album_id(db: &Db, path: &NPath) -> Option<Digest> {
-        db.lookup_value(&*path.append("album"))
-            .and_then(|v| v.get_as::<Chars>())
-            .map(|c| Digest::compute_from_bytes(&*c))
+        Self::load_album(db, path).map(|c| Digest::compute_from_bytes(&*c))
+    }
+
+    fn load_artist(db: &Db, path: &NPath) -> Option<Chars> {
+        db.lookup_value(&*path.append("artist")).and_then(|v| v.get_as::<Chars>())
     }
 
     fn artist_id(db: &Db, path: &NPath) -> Option<Digest> {
-        db.lookup_value(&*path.append("artist"))
-            .and_then(|v| v.get_as::<Chars>())
-            .map(|c| Digest::compute_from_bytes(&*c))
+        Self::load_artist(db, path).map(|c| Digest::compute_from_bytes(&*c))
+    }
+
+    fn load_genre(db: &Db, path: &NPath) -> Option<Chars> {
+        db.lookup_value(&*path.append("genre")).and_then(|v| v.get_as::<Chars>())
     }
 }
 
@@ -353,21 +367,61 @@ impl Album {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SortDir {
+    Ascending,
+    Descending,
+}
+
+impl Into<Value> for SortDir {
+    fn into(self) -> Value {
+        Value::from(match self {
+            Self::Ascending => "ascending",
+            Self::Descending => "descending",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SortCol {
+    Title,
+    Album,
+    Artist,
+    Genre,
+}
+
+impl Into<Value> for SortCol {
+    fn into(self) -> Value {
+        Value::from(match self {
+            Self::Title => "title",
+            Self::Album => "album",
+            Self::Artist => "artist",
+            Self::Genre => "genre",
+        })
+    }
+}
+
 struct Display {
-    artists: FxHashSet<Digest>,
-    albums: FxHashSet<Digest>,
-    tracks: FxHashSet<Digest>,
-    selected_artists: Val,
-    selected_albums: Val,
-    filter: Val,
-    artists_filter: Val,
     albums_filter: Val,
-    tracks_filter: Val,
-    db: Db,
-    publisher: Publisher,
-    base: NPath,
+    albums: FxHashSet<Digest>,
     albums_path: NPath,
+    artists_filter: Val,
+    artists: FxHashSet<Digest>,
+    base: NPath,
+    db: Db,
+    filter_changed: bool,
+    filter: Option<Regex>,
+    filter_val: Val,
+    publisher: Publisher,
+    selected_albums: FxHashSet<Digest>,
+    selected_albums_val: Val,
+    selected_artists: FxHashSet<Digest>,
+    selected_artists_val: Val,
+    sort_column_val: Val,
+    sort_column: IndexMap<SortCol, SortDir, FxBuildHasher>,
+    tracks_filter: Val,
     tracks_path: NPath,
+    tracks: Vec<Digest>,
 }
 
 impl Display {
@@ -410,10 +464,11 @@ impl Display {
         })
     }
 
-    fn apply_filter(&mut self, filter: Option<&Regex>) {
+    fn apply_filter(&mut self) {
         self.albums.clear();
         self.artists.clear();
         self.tracks.clear();
+        let filter = self.filter.as_ref();
         let matching_tracks = Self::iter_tracks(&self.db, &self.base)
             .filter(|t| {
                 filter
@@ -439,17 +494,68 @@ impl Display {
         self.tracks.extend(matching_tracks);
     }
 
-    fn update(
-        &mut self,
-        batch: &mut UpdateBatch,
-        selected_artists: &FxHashSet<Digest>,
-        selected_albums: &FxHashSet<Digest>,
-        filter: Option<Option<&Regex>>,
-    ) -> Result<()> {
-        if let Some(filter) = filter {
-            self.apply_filter(filter);
+    fn compute_visible_tracks(&self) -> Option<Vec<Digest>> {
+        if self.selected_albums.is_empty() && self.selected_artists.is_empty() {
+            None
+        } else {
+            let mut visible = self
+                .tracks
+                .iter()
+                .copied()
+                .filter(|d| {
+                    let path = self.tracks_path.append(&d.to_string());
+                    let album = Track::album_id(&self.db, &path);
+                    let artist = Track::artist_id(&self.db, &path);
+                    let matched_album = self.selected_albums.is_empty()
+                        || album
+                            .as_ref()
+                            .map(|a| self.selected_albums.contains(a))
+                            .unwrap_or(false);
+                    let matched_artist = self.selected_artists.is_empty()
+                        || artist
+                            .as_ref()
+                            .map(|a| self.selected_artists.contains(a))
+                            .unwrap_or(false);
+                    matched_album && matched_artist
+                })
+                .collect::<Vec<Digest>>();
+            if !self.sort_column.is_empty() {
+                visible.sort_by(|v0, v1| {
+                    let path_v0 = self.tracks_path.append(&v0.to_string());
+                    let path_v1 = self.tracks_path.append(&v1.to_string());
+                    let cmp = |f: fn(&Db, &NPath) -> Option<Chars>, dir: &SortDir| {
+                        let v0 = f(&self.db, &path_v0);
+                        let v1 = f(&self.db, &path_v1);
+                        match dir {
+                            SortDir::Descending => v0.cmp(&v1),
+                            SortDir::Ascending => v1.cmp(&v0),
+                        }
+                    };
+                    for (col, dir) in &self.sort_column {
+                        let r = match col {
+                            SortCol::Title => cmp(Track::load_title, dir),
+                            SortCol::Album => cmp(Track::load_album, dir),
+                            SortCol::Artist => cmp(Track::load_artist, dir),
+                            SortCol::Genre => cmp(Track::load_genre, dir),
+                        };
+                        match r {
+                            o @ (Ordering::Greater | Ordering::Less) => return o,
+                            Ordering::Equal => (),
+                        }
+                    }
+                    Ordering::Equal
+                })
+            }
+            Some(visible)
         }
-        let visible_albums = if selected_artists.is_empty() {
+    }
+
+    fn update(&mut self, batch: &mut UpdateBatch) -> Result<()> {
+        if self.filter_changed {
+            self.filter_changed = false;
+            self.apply_filter();
+        }
+        let visible_albums = if self.selected_artists.is_empty() {
             None
         } else {
             let visible = self
@@ -458,7 +564,7 @@ impl Display {
                 .filter_map(|d| {
                     let album =
                         Album::load(&self.db, &self.albums_path.append(&d.to_string()));
-                    if selected_artists.iter().any(|a| album.artists.contains(a)) {
+                    if self.selected_artists.iter().any(|a| album.artists.contains(a)) {
                         Some(*d)
                     } else {
                         None
@@ -467,138 +573,137 @@ impl Display {
                 .collect::<FxHashSet<Digest>>();
             Some(visible)
         };
-        let visible_tracks = if selected_albums.is_empty() && selected_artists.is_empty()
-        {
-            None
-        } else {
-            let visible = self
-                .tracks
-                .iter()
-                .copied()
-                .filter(|d| {
-                    let path = self.tracks_path.append(&d.to_string());
-                    let album = Track::album_id(&self.db, &path);
-                    let artist = Track::artist_id(&self.db, &path);
-                    let matched_album = selected_albums.is_empty()
-                        || album
-                            .as_ref()
-                            .map(|a| selected_albums.contains(a))
-                            .unwrap_or(false);
-                    let matched_artist = selected_artists.is_empty()
-                        || artist
-                            .as_ref()
-                            .map(|a| selected_artists.contains(a))
-                            .unwrap_or(false);
-                    matched_album && matched_artist
-                })
-                .collect::<FxHashSet<Digest>>();
-            Some(visible)
-        };
-        let filter =
-            |visible: Option<FxHashSet<Digest>>, default: &FxHashSet<Digest>| -> Value {
-                match visible {
-                    Some(visible) => {
-                        let v = Value::from(visible);
-                        Value::from(vec![Value::from("include"), v])
-                    }
-                    None => {
-                        let v = Value::from(default.clone());
-                        Value::from(vec![Value::from("include"), v])
-                    }
-                }
-            };
-        self.tracks_filter.update_changed(batch, filter(visible_tracks, &self.tracks));
-        self.albums_filter.update_changed(batch, filter(visible_albums, &self.albums));
-        self.artists_filter.update_changed(batch, filter(None, &self.artists));
+        let visible_tracks = self.compute_visible_tracks();
+        fn to_v<V: Into<Value> + Clone>(visible: Option<V>, default: &V) -> Value {
+            match visible {
+                Some(v) => Value::from(vec![Value::from("include"), v.into()]),
+                None => Value::from(vec![Value::from("include"), default.clone().into()]),
+            }
+        }
+        self.tracks_filter.update_changed(batch, to_v(visible_tracks, &self.tracks));
+        self.albums_filter.update_changed(batch, to_v(visible_albums, &self.albums));
+        self.artists_filter.update_changed(batch, to_v(None, &self.artists));
         Ok(())
+    }
+
+    fn handle_select_albums(&mut self, updates: &mut UpdateBatch, req: WriteRequest) {
+        self.selected_albums.clear();
+        match req.value.clone().cast_to::<Vec<Chars>>() {
+            Ok(set) => {
+                self.selected_albums_val.update_changed(updates, req.value);
+                self.selected_albums.extend(
+                    set.iter()
+                        .filter_map(|p| NPath::dirname(p))
+                        .filter_map(|p| NPath::basename(p))
+                        .filter_map(|p| Digest::from_str(p).ok()),
+                );
+            }
+            Err(_) => {
+                let m = "expected a list of albums";
+                let e = Value::Error(Chars::from(m));
+                self.selected_albums_val.update_changed(updates, e);
+            }
+        }
+    }
+
+    fn handle_select_artists(&mut self, updates: &mut UpdateBatch, req: WriteRequest) {
+        self.selected_artists.clear();
+        match req.value.clone().cast_to::<Vec<Chars>>() {
+            Ok(set) => {
+                self.selected_artists_val.update_changed(updates, req.value);
+                self.selected_artists.extend(
+                    set.iter()
+                        .filter_map(|p| NPath::dirname(p))
+                        .filter_map(|p| NPath::basename(p))
+                        .filter_map(|p| Digest::from_str(p).ok()),
+                );
+            }
+            Err(_) => {
+                let m = "expected a list of artists";
+                let e = Value::Error(Chars::from(m));
+                self.selected_artists_val.update_changed(updates, e);
+            }
+        }
+    }
+
+    fn handle_filter(&mut self, updates: &mut UpdateBatch, req: WriteRequest) {
+        let re = req.value.clone().cast_to::<Chars>().and_then(|s| {
+            if s.trim() == "" {
+                Ok(None)
+            } else if s.starts_with("#r") {
+                let s = s.strip_prefix("#r").ok_or_else(|| anyhow!("missing prefix"))?;
+                Ok(Some(Regex::new(s)?))
+            } else {
+                Ok(Some(Regex::new(&format!("(?i).*{}.*", &*s))?))
+            }
+        });
+        match re {
+            Ok(re) => {
+                self.filter_val.update_changed(updates, req.value);
+                self.filter = re;
+                self.filter_changed = true;
+            }
+            Err(_) => {
+                let e = Value::Error(Chars::from("expected a regex"));
+                self.filter_val.update_changed(updates, e);
+            }
+        }
+    }
+
+    fn handle_sort_column(&mut self, updates: &mut UpdateBatch, req: WriteRequest) {
+        use indexmap::map::Entry;
+        let col = match req.value.cast_to::<Chars>() {
+            Err(_) => return,
+            Ok(c) if &*c == "title" => SortCol::Title,
+            Ok(c) if &*c == "artist" => SortCol::Artist,
+            Ok(c) if &*c == "album" => SortCol::Album,
+            Ok(c) if &*c == "genre" => SortCol::Genre,
+            Ok(_) => return,
+        };
+        match self.sort_column.entry(col) {
+            Entry::Vacant(e) => {
+                e.insert(SortDir::Descending);
+            }
+            Entry::Occupied(mut e) => match e.get_mut() {
+                d @ SortDir::Descending => {
+                    *d = SortDir::Ascending;
+                }
+                SortDir::Ascending => {
+                    e.remove();
+                }
+            },
+        }
+        self.sort_column_val.update_changed(updates, self.sort_column.clone().into());
     }
 
     async fn run(mut self) {
         let (w_tx, mut w_rx) = mpsc::channel(3);
-        self.publisher.writes(self.selected_albums.id(), w_tx.clone());
-        self.publisher.writes(self.selected_artists.id(), w_tx.clone());
-        self.publisher.writes(self.filter.id(), w_tx);
-        let mut selected_artists: FxHashSet<Digest> = HashSet::default();
-        let mut selected_albums: FxHashSet<Digest> = HashSet::default();
-        let mut filter: Option<Regex> = None;
+        self.publisher.writes(self.selected_albums_val.id(), w_tx.clone());
+        self.publisher.writes(self.selected_artists_val.id(), w_tx.clone());
+        self.publisher.writes(self.filter_val.id(), w_tx.clone());
+        self.publisher.writes(self.sort_column_val.id(), w_tx);
         while let Some(mut batch) = w_rx.next().await {
-            let mut filter_changed = false;
             let mut updates = self.publisher.start_batch();
             for req in batch.drain(..) {
                 match req.id {
-                    id if id == self.selected_albums.id() => {
-                        selected_albums.clear();
-                        match req.value.clone().cast_to::<Vec<Chars>>() {
-                            Ok(set) => {
-                                self.selected_albums
-                                    .update_changed(&mut updates, req.value);
-                                selected_albums.extend(
-                                    set.iter()
-                                        .filter_map(|p| NPath::dirname(p))
-                                        .filter_map(|p| NPath::basename(p))
-                                        .filter_map(|p| Digest::from_str(p).ok()),
-                                );
-                            }
-                            Err(_) => {
-                                let m = "expected a list of albums";
-                                let e = Value::Error(Chars::from(m));
-                                self.selected_albums.update_changed(&mut updates, e);
-                            }
-                        }
+                    id if id == self.selected_albums_val.id() => {
+                        self.handle_select_albums(&mut updates, req)
                     }
-                    id if id == self.selected_artists.id() => {
-                        selected_artists.clear();
-                        match req.value.clone().cast_to::<Vec<Chars>>() {
-                            Ok(set) => {
-                                self.selected_artists
-                                    .update_changed(&mut updates, req.value);
-                                selected_artists.extend(
-                                    set.iter()
-                                        .filter_map(|p| NPath::dirname(p))
-                                        .filter_map(|p| NPath::basename(p))
-                                        .filter_map(|p| Digest::from_str(p).ok()),
-                                );
-                            }
-                            Err(_) => {
-                                let m = "expected a list of artists";
-                                let e = Value::Error(Chars::from(m));
-                                self.selected_artists.update_changed(&mut updates, e);
-                            }
-                        }
+                    id if id == self.selected_artists_val.id() => {
+                        self.handle_select_artists(&mut updates, req)
                     }
-                    id if id == self.filter.id() => {
-                        match req.value.clone().cast_to::<Chars>().and_then(|s| {
-                            if s.trim() == "" {
-                                Ok(None)
-                            } else if s.starts_with("#r") {
-                                let s = s
-                                    .strip_prefix("#r")
-                                    .ok_or_else(|| anyhow!("missing prefix"))?;
-                                Ok(Some(Regex::new(s)?))
-                            } else {
-                                Ok(Some(Regex::new(&format!("(?i).*{}.*", &*s))?))
-                            }
-                        }) {
-                            Ok(re) => {
-                                filter_changed = true;
-                                self.filter.update_changed(&mut updates, req.value);
-                                filter = re;
-                            }
-                            Err(_) => {
-                                let e = Value::Error(Chars::from("expected a regex"));
-                                self.filter.update_changed(&mut updates, e);
-                            }
-                        }
+                    id if id == self.filter_val.id() => {
+                        self.handle_filter(&mut updates, req);
+                    }
+                    id if id == self.sort_column_val.id() => {
+                        self.handle_sort_column(&mut updates, req)
                     }
                     id => warn!("unknown write id {:?}", id),
                 }
             }
-            let filter = if filter_changed { Some(filter.as_ref()) } else { None };
             let ts = Instant::now();
             debug!("Display::run: starting update");
-            let r = block_in_place(|| {
-                self.update(&mut updates, &selected_artists, &selected_albums, filter)
-            });
+            let r = block_in_place(|| self.update(&mut updates));
             if let Err(e) = r {
                 error!("update display failed {}", e)
             }
@@ -608,39 +713,46 @@ impl Display {
     }
 
     async fn new(base: NPath, db: Db, publisher: Publisher) -> Result<Self> {
-        let filter = publisher.publish(base.append("filter"), Value::from(""))?;
-        let selected_albums =
-            publisher.publish(base.append("selected-albums"), Value::Null)?;
-        let selected_artists =
-            publisher.publish(base.append("selected-artists"), Value::Null)?;
+        let filter_val = publisher.publish(base.append("filter"), Value::from(""))?;
+        let empty = Value::Array(Arc::from([]));
+        let selected_albums_val =
+            publisher.publish(base.append("selected-albums"), empty.clone())?;
+        let selected_artists_val =
+            publisher.publish(base.append("selected-artists"), empty.clone())?;
         let tracks_filter =
             publisher.publish(base.append("tracks-filter"), Value::Null)?;
         let artists_filter =
             publisher.publish(base.append("artists-filter"), Value::Null)?;
         let albums_filter =
             publisher.publish(base.append("albums-filter"), Value::Null)?;
+        let sort_column_val =
+            publisher.publish(base.append("sort-column"), Value::Null)?;
         let albums_path = base.append("albums");
         let tracks_path = base.append("tracks");
         let mut t = Self {
-            artists: HashSet::default(),
-            albums: HashSet::default(),
-            tracks: HashSet::default(),
-            tracks_filter,
             albums_filter,
-            artists_filter,
-            selected_artists,
-            selected_albums,
-            filter,
-            db,
-            publisher,
-            base,
+            albums: HashSet::default(),
             albums_path,
+            artists_filter,
+            artists: HashSet::default(),
+            base,
+            db,
+            filter_changed: true,
+            filter: None,
+            filter_val,
+            publisher,
+            selected_albums: HashSet::default(),
+            selected_albums_val,
+            selected_artists: HashSet::default(),
+            selected_artists_val,
+            sort_column_val,
+            sort_column: IndexMap::default(),
+            tracks_filter,
             tracks_path,
+            tracks: Vec::new(),
         };
         let mut batch = t.publisher.start_batch();
-        block_in_place(|| {
-            t.update(&mut batch, &HashSet::default(), &HashSet::default(), Some(None))
-        })?;
+        block_in_place(|| t.update(&mut batch))?;
         batch.commit(None).await;
         Ok(t)
     }
