@@ -530,8 +530,8 @@ impl Display {
                         let v0 = f(&self.db, &path_v0);
                         let v1 = f(&self.db, &path_v1);
                         match dir {
-                            SortDir::Descending => v1.cmp(&v0),
-                            SortDir::Ascending => v0.cmp(&v1),
+                            SortDir::Descending => v0.cmp(&v1),
+                            SortDir::Ascending => v1.cmp(&v0),
                         }
                     };
                     for (col, dir) in &self.sort_column {
