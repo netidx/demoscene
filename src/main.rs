@@ -676,7 +676,8 @@ impl Display {
                 }
             },
         }
-        self.sort_column_val.update_changed(updates, self.sort_column.clone().into());
+        let v = (false, self.sort_column.clone());
+        self.sort_column_val.update_changed(updates, v.into());
     }
 
     async fn run(mut self) {
@@ -728,8 +729,14 @@ impl Display {
             publisher.publish(base.append("artists-filter"), Value::Null)?;
         let albums_filter =
             publisher.publish(base.append("albums-filter"), Value::Null)?;
-        let sort_column_val =
-            publisher.publish(base.append("sort-column"), Value::Null)?;
+        let default_sort = [
+            (SortCol::Artist, SortDir::Descending),
+            (SortCol::Album, SortDir::Descending),
+        ]
+        .into_iter()
+        .collect::<IndexMap<_, _, FxBuildHasher>>();
+        let sort_column_val = publisher
+            .publish(base.append("sort-column"), (false, default_sort.clone()).into())?;
         let albums_path = base.append("albums");
         let tracks_path = base.append("tracks");
         let mut t = Self {
@@ -749,7 +756,7 @@ impl Display {
             selected_artists: HashSet::default(),
             selected_artists_val,
             sort_column_val,
-            sort_column: IndexMap::default(),
+            sort_column: default_sort,
             tracks_filter,
             tracks_path,
             tracks: Vec::new(),
