@@ -376,10 +376,12 @@ struct Display {
     filter_changed: bool,
     filter: Option<Regex>,
     filter_val: Val,
+    next_track_val: Val,
     pause_val: Val,
     play: PlayStatus,
     play_queue: IndexSet<Digest, FxBuildHasher>,
     play_val: Val,
+    prev_track_val: Val,
     publisher: Publisher,
     repeat: bool,
     repeat_val: Val,
@@ -737,23 +739,32 @@ impl Display {
         self.shuffle_val.update_changed(up, self.shuffle.into());
     }
 
-    fn next_track(&mut self, up: &mut UpdateBatch, player: &Player) {
+    fn next_track(&mut self, up: &mut UpdateBatch, player: &Player, rev: bool) {
         match self.play {
             PlayStatus::Stopped => (),
             PlayStatus::Paused(_) => (),
             PlayStatus::Playing(track) => {
                 let next = match self.play_queue.get_full(&track) {
                     None => self.play_queue.first(),
-                    Some((i, _)) => match self.play_queue.get_index(i + 1) {
-                        Some(t) => Some(t),
-                        None => {
-                            if self.repeat {
-                                self.play_queue.first()
-                            } else {
-                                None
+                    Some((i, _)) => {
+                        let i = if rev && i == 0 {
+                            0
+                        } else if rev && i > 0 {
+                            i - 1
+                        } else {
+                            i + 1
+                        };
+                        match self.play_queue.get_index(i) {
+                            Some(t) => Some(t),
+                            None => {
+                                if self.repeat {
+                                    self.play_queue.first()
+                                } else {
+                                    None
+                                }
                             }
                         }
-                    },
+                    }
                 };
                 self.pause_val.update_changed(up, Value::False);
                 match next {
@@ -786,7 +797,9 @@ impl Display {
         self.publisher.writes(self.play_val.id(), w_tx.clone());
         self.publisher.writes(self.repeat_val.id(), w_tx.clone());
         self.publisher.writes(self.shuffle_val.id(), w_tx.clone());
-        self.publisher.writes(self.stop_val.id(), w_tx);
+        self.publisher.writes(self.stop_val.id(), w_tx.clone());
+        self.publisher.writes(self.next_track_val.id(), w_tx.clone());
+        self.publisher.writes(self.prev_track_val.id(), w_tx);
         loop {
             let mut updates = self.publisher.start_batch();
             select_biased! {
@@ -820,6 +833,12 @@ impl Display {
                             id if id == self.shuffle_val.id() => {
                                 self.shuffle(&mut updates, req)
                             }
+                            id if id == self.next_track_val.id() => {
+                                self.next_track(&mut updates, &player, false)
+                            }
+                            id if id == self.prev_track_val.id() => {
+                                self.next_track(&mut updates, &player, true)
+                            }
                             id => warn!("unknown write id {:?}", id),
                         }
                     }
@@ -829,7 +848,7 @@ impl Display {
                     }
                 },
                 m = p_rx.select_next_some() => match m {
-                    FromPlayer::Finished => self.next_track(&mut updates, &player),
+                    FromPlayer::Finished => self.next_track(&mut updates, &player, false),
                 },
                 complete => break,
             }
@@ -863,6 +882,8 @@ impl Display {
         let play_val = publisher.publish(base.append("play"), Value::False)?;
         let pause_val = publisher.publish(base.append("pause"), Value::False)?;
         let stop_val = publisher.publish(base.append("stop"), Value::False)?;
+        let next_track_val = publisher.publish(base.append("next"), Value::Null)?;
+        let prev_track_val = publisher.publish(base.append("prev"), Value::Null)?;
         let albums_path = base.append("albums");
         let tracks_path = base.append("tracks");
         let mut t = Self {
@@ -873,25 +894,27 @@ impl Display {
             artists: HashSet::default(),
             base,
             db,
-            shuffle_val,
-            shuffle: false,
-            repeat_val,
-            repeat: false,
-            play_val,
-            play_queue: IndexSet::default(),
-            play: PlayStatus::Stopped,
-            pause_val,
-            stop_val,
             filter_changed: true,
             filter: None,
             filter_val,
+            next_track_val,
+            pause_val,
+            play: PlayStatus::Stopped,
+            play_queue: IndexSet::default(),
+            play_val,
+            prev_track_val,
             publisher,
+            repeat: false,
+            repeat_val,
             selected_albums: HashSet::default(),
             selected_albums_val,
             selected_artists: HashSet::default(),
             selected_artists_val,
-            sort_column_val,
+            shuffle: false,
+            shuffle_val,
             sort_column: default_sort,
+            sort_column_val,
+            stop_val,
             tracks_filter,
             tracks_path,
             tracks: Vec::new(),
