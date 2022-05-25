@@ -4,7 +4,7 @@ use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use glib::clone;
 use gstreamer::prelude::*;
 use indexmap::{IndexMap, IndexSet};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use netidx::{
     chars::Chars,
     pack::Pack,
@@ -740,7 +740,7 @@ impl Display {
     fn next_track(&mut self, up: &mut UpdateBatch, player: &Player) {
         match self.play {
             PlayStatus::Stopped => (),
-            PlayStatus::Paused(track) => (),
+            PlayStatus::Paused(_) => (),
             PlayStatus::Playing(track) => {
                 let next = match self.play_queue.get_full(&track) {
                     None => self.play_queue.first(),
