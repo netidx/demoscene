@@ -26,7 +26,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
 use tokio::task::block_in_place;
