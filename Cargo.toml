@@ -37,3 +37,5 @@ structopt = "0.3"
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 indexmap = "1"
+parking_lot = "0.12"
+rand = "0.8"
