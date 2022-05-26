@@ -5,6 +5,7 @@ use glib::clone;
 use gstreamer::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use log::{error, info, warn};
+use rand::prelude::*;
 use netidx::{
     chars::Chars,
     pack::Pack,
@@ -389,6 +390,7 @@ struct Display {
     selected_albums_val: Val,
     selected_artists: FxHashSet<Digest>,
     selected_artists_val: Val,
+    shuffle_seed: u64,
     shuffle: bool,
     shuffle_val: Val,
     sort_column: IndexMap<SortCol, SortDir, FxBuildHasher>,
@@ -533,8 +535,7 @@ impl Display {
         self.play_queue.clear();
         self.play_queue.extend(visible);
         if self.shuffle {
-            use rand::prelude::*;
-            let mut r = thread_rng();
+            let mut r = StdRng::seed_from_u64(self.shuffle_seed);
             let l = self.play_queue.len();
             for i in 0..l {
                 self.play_queue.swap_indices(i, r.gen_range(i..l));
@@ -735,6 +736,9 @@ impl Display {
     }
 
     fn shuffle(&mut self, up: &mut UpdateBatch, req: WriteRequest) {
+        if !self.shuffle {
+            self.shuffle_seed = random();
+        }
         self.shuffle = req.value.cast_to::<bool>().unwrap_or(!self.shuffle);
         self.shuffle_val.update_changed(up, self.shuffle.into());
     }
@@ -910,6 +914,7 @@ impl Display {
             selected_albums_val,
             selected_artists: HashSet::default(),
             selected_artists_val,
+            shuffle_seed: random(),
             shuffle: false,
             shuffle_val,
             sort_column: default_sort,
