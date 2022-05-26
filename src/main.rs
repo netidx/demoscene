@@ -752,7 +752,7 @@ impl Display {
                     None => self.play_queue.first(),
                     Some((i, _)) => {
                         let i = if rev && i == 0 {
-                            0
+                            self.play_queue.len() - 1
                         } else if rev && i > 0 {
                             i - 1
                         } else {
