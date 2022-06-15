@@ -5,7 +5,6 @@ use glib::clone;
 use gstreamer::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use log::{error, info, warn};
-use rand::prelude::*;
 use netidx::{
     chars::Chars,
     pack::Pack,
@@ -17,6 +16,7 @@ use netidx::{
 use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
 use netidx_tools::ClientParams;
 use parking_lot::Mutex;
+use rand::prelude::*;
 use regex::Regex;
 use std::{
     cmp::Ordering,
@@ -32,7 +32,7 @@ use std::{
 use structopt::StructOpt;
 use tokio::task::block_in_place;
 
-static DEFAULT_VIEW:&str = include_str!("main.view");
+static DEFAULT_VIEW: &str = include_str!("main.view");
 
 #[derive(StructOpt, Debug)]
 struct Params {
@@ -41,8 +41,12 @@ struct Params {
     #[structopt(flatten)]
     client_params: ClientParams,
     #[structopt(long = "library", help = "path to the music library")]
-    library_path: String,
-    #[structopt(long = "base", help = "base path of the app in netidx")]
+    library_path: Option<String>,
+    #[structopt(
+        long = "base",
+        help = "base path of the app in netidx",
+        default_value = "/local/music"
+    )]
     base: String,
 }
 
@@ -1204,16 +1208,40 @@ async fn init_library(
     Ok(())
 }
 
+fn params() -> Result<Params> {
+    let mut args = Params::from_args();
+    if args.container_config.db.is_none() {
+        let path = dirs::data_dir()
+            .map(|mut p| {
+                p.push("demoscene");
+                p
+            })
+            .ok_or_else(|| {
+                anyhow!("db dir not specified and the default couldn't be determined")
+            })?;
+        args.container_config.db = Some(path.to_string_lossy().into_owned());
+    }
+    if args.library_path.is_none() {
+        let path = dirs::audio_dir().ok_or_else(|| {
+            anyhow!(
+                "music library path not specified and the default can't be determined"
+            )
+        })?;
+        args.library_path = Some(path.to_string_lossy().into_owned());
+    }
+    Ok(args)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let args = Params::from_args();
+    let args = params()?;
     env_logger::init();
-    let base = NPath::from(&args.base.clone());
+    let base = NPath::from(&args.base);
     let (config, desired_auth) = args.client_params.load();
     let container = Container::start(config, desired_auth, args.container_config).await?;
     let publisher = container.publisher().await?;
     let db = container.db().await?;
-    init_library(&args.library_path, base.clone(), &container).await?;
+    init_library(&args.library_path.as_ref().unwrap(), base.clone(), &container).await?;
     Display::new(base, db, publisher).await?.run().await;
     Ok(())
 }
