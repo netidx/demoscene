@@ -1116,12 +1116,12 @@ impl TaggedTrack {
             }
         }
         if EMPTY.is_match(&*track.artist) {
-            if let Some(artist) = part(library, path, 3) {
+            if let Some(artist) = part(library, path, 2) {
                 track.artist = Chars::from(String::from(artist));
             }
         }
         if EMPTY.is_match(&*track.album) {
-            if let Some(album) = part(library, path, 2) {
+            if let Some(album) = part(library, path, 1) {
                 track.album = Chars::from(String::from(album));
             }
         }
