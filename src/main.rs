@@ -419,6 +419,7 @@ struct Display {
     artists: FxHashSet<Digest>,
     base: NPath,
     db: Db,
+    container: Container,
     duration_val: Val,
     duration: Option<ClockTime>,
     filter_changed: bool,
@@ -821,6 +822,9 @@ impl Display {
             PlayStatus::Stopped => (),
             PlayStatus::Paused(_) => (),
             PlayStatus::Playing(track) => {
+                let status = self.tracks_path.append(&track.to_string()).append("status");
+                let mut txn = Txn::new();
+                txn.set_data(true, status, Value::from(""), None);
                 let next = match self.play_queue.get_full(&track) {
                     None => self.play_queue.first(),
                     Some((i, _)) => {
@@ -856,8 +860,11 @@ impl Display {
                         self.play_val.update_changed(up, track.into());
                         let _ = player.play(Some(*track));
                         self.play = PlayStatus::Playing(*track);
+                        let status = self.tracks_path.append(&track.to_string()).append("status");
+                        txn.set_data(true, status, Value::from("media-playback-start"), None);
                     }
                 }
+                let _ = self.container.commit_unbounded(txn);
             }
         }
     }
@@ -950,7 +957,7 @@ impl Display {
         }
     }
 
-    async fn new(base: NPath, db: Db, publisher: Publisher) -> Result<Self> {
+    async fn new(base: NPath, container: Container, db: Db, publisher: Publisher) -> Result<Self> {
         let filter_val = publisher.publish(base.append("filter"), Value::from(""))?;
         let empty = Value::Array(Arc::from([]));
         let selected_albums_val =
@@ -993,6 +1000,7 @@ impl Display {
             artists: HashSet::default(),
             base,
             db,
+            container,
             duration: None,
             duration_val,
             filter_changed: true,
@@ -1234,6 +1242,7 @@ fn scan_track(
         .map(Value::from)
         .unwrap_or(Value::from(Chars::from("")));
     set("track", n);
+    set("status", Value::from(""));
     set("length", Value::from(tag.length));
     set("artist", Value::from(tag.artist.clone()));
     let a = artists.entry(tag.artist.clone()).or_insert_with(Artist::new);
@@ -1448,6 +1457,6 @@ async fn main() -> Result<()> {
     let publisher = container.publisher().await?;
     let db = container.db().await?;
     init_library(&args.library_path.as_ref().unwrap(), base.clone(), &container).await?;
-    Display::new(base, db, publisher).await?.run().await;
+    Display::new(base, container, db, publisher).await?.run().await;
     Ok(())
 }
