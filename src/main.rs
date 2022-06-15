@@ -1168,7 +1168,12 @@ fn scan_track(
         txn.set_data(true, key, val, None);
     };
     set("file", Value::from(Chars::from(String::from(path))));
-    let n = tag.track_number.parse::<i32>().ok().map(Value::from).unwrap_or(Value::Null);
+    let n = tag
+        .track_number
+        .parse::<i32>()
+        .ok()
+        .map(Value::from)
+        .unwrap_or(Value::from(Chars::from("")));
     set("track", n);
     set("length", Value::from(tag.length));
     set("artist", Value::from(tag.artist.clone()));
