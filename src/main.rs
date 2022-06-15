@@ -56,9 +56,9 @@ fn pretty_clock_time(t: ClockTime) -> String {
     if t.hours() > 0 {
         let minutes = t.minutes() - t.hours() * 60;
         let seconds = t.seconds() - (t.hours() * 3600 + t.minutes() * 60);
-        format!("{:.2}:{:.2}:{:.2}", t.hours(), minutes, seconds)
+        format!("{:02}:{:02}:{:02}", t.hours(), minutes, seconds)
     } else {
-        format!("{:.2}:{:.2}", t.minutes(), t.seconds() - t.minutes() * 60)
+        format!("{:02}:{:02}", t.minutes(), t.seconds() - t.minutes() * 60)
     }
 }
 
