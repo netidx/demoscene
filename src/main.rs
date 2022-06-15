@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate lazy_static;
 use anyhow::{anyhow, bail, Result};
 use futures::{channel::mpsc, select_biased, StreamExt};
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -1000,6 +1002,121 @@ fn dirs_to_scan(
     Ok(res)
 }
 
+struct TaggedTrack {
+    track_number: Chars,
+    length: Chars,
+    title: Chars,
+    artist: Chars,
+    album: Chars,
+    genre: Chars,
+}
+
+impl TaggedTrack {
+    fn read(path: &str) -> Result<TaggedTrack> {
+        use lofty::{read_from_path, Accessor, ItemKey, ItemValue};
+        use std::path::Path;
+        lazy_static! {
+            static ref TRACK_NR: Regex =
+                Regex::new("^\\s*([0-9]+)\\s*|\\s*([0-9]+)\\s*$").unwrap();
+        }
+        let tags = read_from_path(path, false)?;
+        let mut track = Self {
+            track_number: Chars::from(""),
+            length: Chars::from(""),
+            title: Chars::from(""),
+            artist: Chars::from(""),
+            album: Chars::from(""),
+            genre: Chars::from(""),
+        };
+        macro_rules! set {
+            ($field:expr, $val:expr) => {
+                if let Some(val) = $val {
+                    if val.len() > $field.len() {
+                        $field = Chars::from(String::from(val));
+                    }
+                }
+            };
+        }
+        for tag in tags.tags() {
+            set!(track.title, tag.title());
+            set!(track.artist, tag.artist());
+            set!(track.album, tag.album());
+            set!(track.genre, tag.genre());
+            for item in tag.items() {
+                match item.key() {
+                    ItemKey::TrackNumber => match item.value() {
+                        ItemValue::Text(s) => set!(track.track_number, Some(s.as_str())),
+                        ItemValue::Binary(b) => {
+                            dbg!(b);
+                            ()
+                        }
+                        ItemValue::Locator(l) => {
+                            dbg!(l);
+                            ()
+                        }
+                    },
+                    ItemKey::Length => match item.value() {
+                        ItemValue::Text(s) => set!(track.length, Some(s.as_str())),
+                        ItemValue::Binary(b) => {
+                            dbg!(b);
+                            ()
+                        }
+                        ItemValue::Locator(l) => {
+                            dbg!(l);
+                            ()
+                        }
+                    },
+                    _ => (),
+                }
+            }
+        }
+        let path = Path::new(path);
+        fn part<'a>(path: &'a Path, n: usize) -> Option<&'a str> {
+            let home = dirs::home_dir();
+            path
+                .ancestors()
+                .nth(n)
+                .and_then(|p| {
+                    if home.is_none() || p.starts_with(home.unwrap()) {
+                        p.file_name()
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|p| p.to_str())
+        }
+        if track.track_number.len() == 0 {
+            let nr = path
+                .file_stem()
+                .and_then(|f| f.to_str())
+                .and_then(|f| TRACK_NR.captures(f))
+                .and_then(|c| c.get(1).or_else(|| c.get(2)))
+                .map(|c| c.as_str());
+            if let Some(nr) = nr {
+                track.track_number = Chars::from(String::from(nr));
+            }
+        }
+        if track.artist.len() == 0 {
+            if let Some(artist) = part(path, 3) {
+                track.artist = Chars::from(String::from(artist));
+            }
+        }
+        if track.album.len() == 0 {
+            if let Some(album) = part(path, 2) {
+                track.album = Chars::from(String::from(album));
+            }
+        }
+        if track.title.len() == 0 {
+            let title = path.file_stem().and_then(|p| p.to_str());
+            if let Some(title) = title {
+                let title = TRACK_NR.replace(title, "");
+                track.title = Chars::from(String::from(title));
+            }
+        }
+        Ok(track)
+    }
+}
+
 fn scan_track(
     artists: &mut FxHashMap<Chars, Artist>,
     albums: &mut FxHashMap<Chars, Album>,
@@ -1007,47 +1124,24 @@ fn scan_track(
     path: &str,
     base: &NPath,
 ) -> Result<()> {
-    use lofty::{read_from_path, Accessor};
     let hash = Digest::compute_from_file(&path)?;
     let track = base.append(&format!("tracks/{:x}", (hash.0)));
-    let mut set = |name, val| {
+    let mut set = |name, val: Chars| {
         let key = track.append(name);
-        let val = match val {
-            None => Value::Null,
-            Some(val) => Value::from(String::from(val)),
-        };
-        txn.set_data(true, key, val, None);
+        txn.set_data(true, key, Value::from(val), None);
     };
-    let tagged = read_from_path(path, false)?;
-    set("file", Some(path));
-    if let Some(tag) = tagged.primary_tag() {
-        set("artist", tag.artist());
-        if let Some(artist) = tag.artist() {
-            let a = artists
-                .entry(Chars::from(String::from(artist)))
-                .or_insert_with(Artist::new);
-            a.tracks.insert(hash);
-            if let Some(album) = tag.album() {
-                a.albums.insert(Digest::compute_from_bytes(album));
-            }
-        }
-        set("title", tag.title());
-        set("album", tag.album());
-        if let Some(album) = tag.album() {
-            let a =
-                albums.entry(Chars::from(String::from(album))).or_insert_with(Album::new);
-            a.tracks.insert(hash);
-            if let Some(artist) = tag.artist() {
-                a.artists.insert(Digest::compute_from_bytes(artist));
-            }
-        }
-        set("genre", tag.genre());
-    } else {
-        set("artist", None);
-        set("title", None);
-        set("album", None);
-        set("genre", None);
-    }
+    set("file", Chars::from(String::from(path)));
+    let tag = TaggedTrack::read(path)?;
+    set("artist", tag.artist.clone());
+    let a = artists.entry(tag.artist.clone()).or_insert_with(Artist::new);
+    a.tracks.insert(hash);
+    a.albums.insert(Digest::compute_from_bytes(&*tag.album));
+    set("title", tag.title);
+    set("album", tag.album.clone());
+    let a = albums.entry(tag.album).or_insert_with(Album::new);
+    a.tracks.insert(hash);
+    a.artists.insert(Digest::compute_from_bytes(&*tag.artist));
+    set("genre", tag.genre);
     Ok(())
 }
 
