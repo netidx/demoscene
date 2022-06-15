@@ -32,6 +32,8 @@ use std::{
 use structopt::StructOpt;
 use tokio::task::block_in_place;
 
+static DEFAULT_VIEW:&str = include_str!("main.view");
+
 #[derive(StructOpt, Debug)]
 struct Params {
     #[structopt(flatten)]
@@ -1161,6 +1163,17 @@ fn scan_everything(
     Ok(scan_dirs(&to_scan, &base, container, db)?)
 }
 
+async fn setup_default_view(container: &Container, db: &Db, base: &NPath) -> Result<()> {
+    let view_path = base.append(".view");
+    if db.lookup_value(&*view_path).is_none() {
+        let mut txn = Txn::new();
+        txn.set_data(true, view_path, Value::from(DEFAULT_VIEW), None);
+        Ok(container.commit(txn).await?)
+    } else {
+        Ok(())
+    }
+}
+
 async fn init_library(
     library_path: &str,
     base: NPath,
@@ -1169,6 +1182,7 @@ async fn init_library(
     let db = container.db().await?;
     let roots = db.roots().collect::<Result<Vec<_>>>()?;
     let dirs_tree = db.open_tree("dirs")?;
+    setup_default_view(container, &db, &base).await?;
     if roots.contains(&base) {
         block_in_place(|| {
             scan_modified(library_path, &base, container, &db, &dirs_tree)
