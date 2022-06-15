@@ -1012,12 +1012,15 @@ struct TaggedTrack {
 }
 
 impl TaggedTrack {
-    fn read(base: &str, path: &str) -> Result<TaggedTrack> {
+    fn read(library: &str, path: &str) -> Result<TaggedTrack> {
         use lofty::{read_from_path, Accessor, ItemKey, ItemValue};
         use std::path::Path;
         lazy_static! {
             static ref TRACK_NR: Regex =
                 Regex::new("^\\s*([0-9]+)\\s*|\\s*([0-9]+)\\s*$").unwrap();
+            static ref CLEANUP: Regex =
+                Regex::new("^[[:^alpha:]0-9\\s]*|[[:^alpha:]0-9\\s]*$").unwrap();
+            static ref EMPTY: Regex = Regex::new("^\\s*$").unwrap();
         }
         let tags = read_from_path(path, false)?;
         let mut track = Self {
@@ -1046,37 +1049,26 @@ impl TaggedTrack {
                 match item.key() {
                     ItemKey::TrackNumber => match item.value() {
                         ItemValue::Text(s) => set!(track.track_number, Some(s.as_str())),
-                        ItemValue::Binary(b) => {
-                            dbg!(b);
-                            ()
-                        }
-                        ItemValue::Locator(l) => {
-                            dbg!(l);
-                            ()
-                        }
+                        ItemValue::Binary(_) | ItemValue::Locator(_) => (),
                     },
                     ItemKey::Length => match item.value() {
                         ItemValue::Text(s) => set!(track.length, Some(s.as_str())),
-                        ItemValue::Binary(b) => {
-                            dbg!(b);
-                            ()
-                        }
-                        ItemValue::Locator(l) => {
-                            dbg!(l);
-                            ()
-                        }
+                        ItemValue::Binary(_) | ItemValue::Locator(_) => (),
                     },
                     _ => (),
                 }
             }
         }
         let path = Path::new(path);
-        fn part<'a>(base: &str, path: &'a Path, n: usize) -> Option<&'a str> {
-            path
-                .ancestors()
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("no extension"))?;
+        fn part<'a>(library: &str, path: &'a Path, n: usize) -> Option<&'a str> {
+            path.ancestors()
                 .nth(n)
                 .and_then(|p| {
-                    if p.starts_with(base) {
+                    if p.to_str() != Some(library) && p.starts_with(library) {
                         p.file_name()
                     } else {
                         None
@@ -1084,7 +1076,19 @@ impl TaggedTrack {
                 })
                 .and_then(|p| p.to_str())
         }
-        if track.track_number.len() == 0 {
+        if ext != "m4a"
+            && ext != "m4p"
+            && ext != "mp3"
+            && ext != "wav"
+            && ext != "ogg"
+            && ext != "flac"
+            && ext != "opus"
+            && ext != "aiff"
+            && ext != "webm"
+        {
+            bail!("bad file type")
+        }
+        if EMPTY.is_match(&*track.track_number) {
             let nr = path
                 .file_stem()
                 .and_then(|f| f.to_str())
@@ -1095,20 +1099,20 @@ impl TaggedTrack {
                 track.track_number = Chars::from(String::from(nr));
             }
         }
-        if track.artist.len() == 0 {
-            if let Some(artist) = part(base, path, 3) {
+        if EMPTY.is_match(&*track.artist) {
+            if let Some(artist) = part(library, path, 3) {
                 track.artist = Chars::from(String::from(artist));
             }
         }
-        if track.album.len() == 0 {
-            if let Some(album) = part(base, path, 2) {
+        if EMPTY.is_match(&*track.album) {
+            if let Some(album) = part(library, path, 2) {
                 track.album = Chars::from(String::from(album));
             }
         }
-        if track.title.len() == 0 {
+        if EMPTY.is_match(&*track.title) {
             let title = path.file_stem().and_then(|p| p.to_str());
             if let Some(title) = title {
-                let title = TRACK_NR.replace(title, "");
+                let title = CLEANUP.replace_all(title, "");
                 track.title = Chars::from(String::from(title));
             }
         }
@@ -1120,9 +1124,11 @@ fn scan_track(
     artists: &mut FxHashMap<Chars, Artist>,
     albums: &mut FxHashMap<Chars, Album>,
     txn: &mut Txn,
+    library: &str,
     path: &str,
     base: &NPath,
 ) -> Result<()> {
+    let tag = TaggedTrack::read(library, path)?;
     let hash = Digest::compute_from_file(&path)?;
     let track = base.append(&format!("tracks/{:x}", (hash.0)));
     let mut set = |name, val: Chars| {
@@ -1130,7 +1136,8 @@ fn scan_track(
         txn.set_data(true, key, Value::from(val), None);
     };
     set("file", Chars::from(String::from(path)));
-    let tag = TaggedTrack::read(&*base, path)?;
+    set("track", tag.track_number);
+    set("length", tag.length);
     set("artist", tag.artist.clone());
     let a = artists.entry(tag.artist.clone()).or_insert_with(Artist::new);
     a.tracks.insert(hash);
@@ -1145,6 +1152,7 @@ fn scan_track(
 }
 
 fn scan_dir(
+    library: &str,
     dir: &str,
     base: &NPath,
     container: &Container,
@@ -1166,7 +1174,14 @@ fn scan_dir(
         .fold(
             || (Txn::new(), HashMap::default(), HashMap::default()),
             |(mut txn, mut artists, mut albums), track| {
-                let _ = scan_track(&mut artists, &mut albums, &mut txn, &track, base);
+                let _ = scan_track(
+                    &mut artists,
+                    &mut albums,
+                    &mut txn,
+                    library,
+                    &track,
+                    base,
+                );
                 (txn, artists, albums)
             },
         )
@@ -1188,6 +1203,7 @@ fn scan_dir(
 }
 
 fn scan_dirs(
+    library: &str,
     dirs: &FxHashSet<String>,
     base: &NPath,
     container: &Container,
@@ -1195,7 +1211,7 @@ fn scan_dirs(
 ) -> Result<()> {
     use rayon::prelude::*;
     let (artists, albums) =
-        dirs.par_iter().map(|dir| scan_dir(dir, base, container)).reduce(
+        dirs.par_iter().map(|dir| scan_dir(library, dir, base, container)).reduce(
             || Ok((HashMap::default(), HashMap::default())),
             |r0, r1| match (r0, r1) {
                 (_, Err(e)) | (Err(e), _) => Err(e),
@@ -1243,7 +1259,7 @@ fn scan_modified(
 ) -> Result<()> {
     let dirs = dirs(path)?;
     let to_scan = dirs_to_scan(&dirs, &dirs_tree)?;
-    Ok(scan_dirs(&to_scan, &base, container, db)?)
+    Ok(scan_dirs(path, &to_scan, &base, container, db)?)
 }
 
 // scan every track in the library
@@ -1257,7 +1273,7 @@ fn scan_everything(
     let dirs = dirs(path)?;
     let _ = dirs_to_scan(&dirs, &dirs_tree)?; // store the dirs mod timestamps
     let to_scan = dirs.into_iter().map(|(k, _)| k).collect::<FxHashSet<String>>();
-    Ok(scan_dirs(&to_scan, &base, container, db)?)
+    Ok(scan_dirs(path, &to_scan, &base, container, db)?)
 }
 
 async fn setup_default_view(container: &Container, db: &Db, base: &NPath) -> Result<()> {
