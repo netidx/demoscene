@@ -245,6 +245,7 @@ impl Player {
 }
 
 struct Track {
+    _track: Option<Chars>,
     album: Option<Chars>,
     artist: Option<Chars>,
     genre: Option<Chars>,
@@ -253,6 +254,10 @@ struct Track {
 }
 
 impl Track {
+    fn load_track(db: &Db, path: &NPath) -> Option<Chars> {
+        db.lookup_value(&*path.append("track")).and_then(|v| v.get_as::<Chars>())
+    }
+
     fn load_title(db: &Db, path: &NPath) -> Option<Chars> {
         db.lookup_value(&*path.append("title")).and_then(|v| v.get_as::<Chars>())
     }
@@ -351,6 +356,7 @@ impl Into<Value> for SortDir {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SortCol {
+    Track,
     Title,
     Album,
     Artist,
@@ -360,6 +366,7 @@ enum SortCol {
 impl Into<Value> for SortCol {
     fn into(self) -> Value {
         Value::from(match self {
+            Self::Track => "track",
             Self::Title => "title",
             Self::Album => "album",
             Self::Artist => "artist",
@@ -411,6 +418,7 @@ struct Display {
 
 impl Display {
     fn iter_tracks(db: &Db, base: &NPath) -> impl Iterator<Item = Track> {
+        let mut track = None;
         let mut album = None;
         let mut artist = None;
         let mut genre = None;
@@ -424,6 +432,10 @@ impl Display {
             };
             let column = NPath::basename(&path)?;
             match column {
+                "track" => {
+                    track = decode();
+                    None
+                }
                 "album" => {
                     album = decode();
                     None
@@ -438,6 +450,7 @@ impl Display {
                     None
                 }
                 "title" => Some(Track {
+                    _track: track.take(),
                     album: album.take(),
                     artist: artist.take(),
                     genre: genre.take(),
@@ -521,6 +534,7 @@ impl Display {
                     };
                     for (col, dir) in &self.sort_column {
                         let r = match col {
+                            SortCol::Track => cmp(Track::load_track, dir),
                             SortCol::Title => cmp(Track::load_title, dir),
                             SortCol::Album => cmp(Track::load_album, dir),
                             SortCol::Artist => cmp(Track::load_artist, dir),
@@ -656,6 +670,7 @@ impl Display {
         use indexmap::map::Entry;
         let col = match req.value.cast_to::<Chars>() {
             Err(_) => return,
+            Ok(c) if &*c == "track" => SortCol::Track,
             Ok(c) if &*c == "title" => SortCol::Title,
             Ok(c) if &*c == "artist" => SortCol::Artist,
             Ok(c) if &*c == "album" => SortCol::Album,
@@ -884,6 +899,7 @@ impl Display {
         let default_sort = [
             (SortCol::Artist, SortDir::Descending),
             (SortCol::Album, SortDir::Descending),
+            (SortCol::Track, SortDir::Descending)
         ]
         .into_iter()
         .collect::<IndexMap<_, _, FxBuildHasher>>();
