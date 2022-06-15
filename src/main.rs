@@ -1012,7 +1012,7 @@ struct TaggedTrack {
 }
 
 impl TaggedTrack {
-    fn read(path: &str) -> Result<TaggedTrack> {
+    fn read(base: &str, path: &str) -> Result<TaggedTrack> {
         use lofty::{read_from_path, Accessor, ItemKey, ItemValue};
         use std::path::Path;
         lazy_static! {
@@ -1071,13 +1071,12 @@ impl TaggedTrack {
             }
         }
         let path = Path::new(path);
-        fn part<'a>(path: &'a Path, n: usize) -> Option<&'a str> {
-            let home = dirs::home_dir();
+        fn part<'a>(base: &str, path: &'a Path, n: usize) -> Option<&'a str> {
             path
                 .ancestors()
                 .nth(n)
                 .and_then(|p| {
-                    if home.is_none() || p.starts_with(home.unwrap()) {
+                    if p.starts_with(base) {
                         p.file_name()
                     } else {
                         None
@@ -1097,12 +1096,12 @@ impl TaggedTrack {
             }
         }
         if track.artist.len() == 0 {
-            if let Some(artist) = part(path, 3) {
+            if let Some(artist) = part(base, path, 3) {
                 track.artist = Chars::from(String::from(artist));
             }
         }
         if track.album.len() == 0 {
-            if let Some(album) = part(path, 2) {
+            if let Some(album) = part(base, path, 2) {
                 track.album = Chars::from(String::from(album));
             }
         }
@@ -1131,7 +1130,7 @@ fn scan_track(
         txn.set_data(true, key, Value::from(val), None);
     };
     set("file", Chars::from(String::from(path)));
-    let tag = TaggedTrack::read(path)?;
+    let tag = TaggedTrack::read(&*base, path)?;
     set("artist", tag.artist.clone());
     let a = artists.entry(tag.artist.clone()).or_insert_with(Artist::new);
     a.tracks.insert(hash);
