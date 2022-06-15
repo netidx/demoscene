@@ -52,6 +52,16 @@ struct Params {
     base: String,
 }
 
+fn pretty_clock_time(t: ClockTime) -> String {
+    if t.hours() > 0 {
+        let minutes = t.minutes() - t.hours() * 60;
+        let seconds = t.seconds() - (t.hours() * 3600 + t.minutes() * 60);
+        format!("{:.2}:{:.2}:{:.2}", t.hours(), minutes, seconds)
+    } else {
+        format!("{:.2}:{:.2}", t.minutes(), t.seconds() - t.minutes() * 60)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct Digest(md5::Digest);
 
@@ -419,6 +429,7 @@ struct Display {
     play: PlayStatus,
     play_queue: IndexSet<Digest, FxBuildHasher>,
     play_val: Val,
+    position_fraction: Val,
     position: Val,
     prev_track_val: Val,
     publisher: Publisher,
@@ -916,21 +927,18 @@ impl Display {
                 m = p_rx.select_next_some() => match m {
                     FromPlayer::Duration(t) => {
                         self.duration = Some(t);
-                        let v = if t.hours() > 0 {
-                            format!("{}:{}:{}", t.hours(), t.minutes(), t.seconds())
-                        } else {
-                            format!("{}:{}", t.minutes(), t.seconds())
-                        };
+                        let v = pretty_clock_time(t);
                         self.duration_val.update(&mut updates, v.into());
                     },
                     FromPlayer::Position(t) => {
                         if let Some(duration) = self.duration {
                             let position = t.nseconds() as f64 / duration.nseconds() as f64;
-                            self.position.update(&mut updates, position.into());
+                            self.position_fraction.update(&mut updates, position.into());
+                            self.position.update(&mut updates, pretty_clock_time(t).into());
                         }
                     },
                     FromPlayer::Finished => {
-                        self.position.update(&mut updates, 0.into());
+                        self.position.update(&mut updates, (0.).into());
                         self.duration_val.update(&mut updates, "".into());
                         self.duration = None;
                         self.next_track(&mut updates, &player, false)
@@ -971,7 +979,9 @@ impl Display {
         let stop_val = publisher.publish(base.append("stop"), Value::False)?;
         let next_track_val = publisher.publish(base.append("next"), Value::Null)?;
         let prev_track_val = publisher.publish(base.append("prev"), Value::Null)?;
-        let position = publisher.publish(base.append("position"), Value::from(0.))?;
+        let position = publisher.publish(base.append("position"), Value::from(""))?;
+        let position_fraction =
+            publisher.publish(base.append("position-fraction"), Value::from(0.))?;
         let duration_val = publisher.publish(base.append("duration"), Value::from(""))?;
         let albums_path = base.append("albums");
         let tracks_path = base.append("tracks");
@@ -983,8 +993,8 @@ impl Display {
             artists: HashSet::default(),
             base,
             db,
-            duration_val,
             duration: None,
+            duration_val,
             filter_changed: true,
             filter: None,
             filter_val,
@@ -994,6 +1004,7 @@ impl Display {
             play_queue: IndexSet::default(),
             play_val,
             position,
+            position_fraction,
             prev_track_val,
             publisher,
             repeat: false,
