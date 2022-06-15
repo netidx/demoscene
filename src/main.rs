@@ -54,11 +54,16 @@ struct Params {
 
 fn pretty_clock_time(t: ClockTime) -> String {
     if t.hours() > 0 {
-        let minutes = t.minutes() - t.hours() * 60;
-        let seconds = t.seconds() - (t.hours() * 3600 + t.minutes() * 60);
-        format!("{:02}:{:02}:{:02}", t.hours(), minutes, seconds)
+        let hours = t.hours() as i64;
+        let minutes = t.minutes() as i64;
+        let seconds = t.seconds() as i64;
+        let minutes = minutes - hours * 60;
+        let seconds = seconds - (hours * 3600 + minutes * 60);
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
     } else {
-        format!("{:02}:{:02}", t.minutes(), t.seconds() - t.minutes() * 60)
+        let minutes = t.minutes() as i64;
+        let seconds = t.seconds() as i64;
+        format!("{:02}:{:02}", minutes, seconds - minutes * 60)
     }
 }
 
@@ -419,7 +424,6 @@ struct Display {
     artists: FxHashSet<Digest>,
     base: NPath,
     db: Db,
-    container: Container,
     duration_val: Val,
     duration: Option<ClockTime>,
     filter_changed: bool,
@@ -822,9 +826,6 @@ impl Display {
             PlayStatus::Stopped => (),
             PlayStatus::Paused(_) => (),
             PlayStatus::Playing(track) => {
-                let status = self.tracks_path.append(&track.to_string()).append("status");
-                let mut txn = Txn::new();
-                txn.set_data(true, status, Value::from(""), None);
                 let next = match self.play_queue.get_full(&track) {
                     None => self.play_queue.first(),
                     Some((i, _)) => {
@@ -860,11 +861,8 @@ impl Display {
                         self.play_val.update_changed(up, track.into());
                         let _ = player.play(Some(*track));
                         self.play = PlayStatus::Playing(*track);
-                        let status = self.tracks_path.append(&track.to_string()).append("status");
-                        txn.set_data(true, status, Value::from("media-playback-start"), None);
                     }
                 }
-                let _ = self.container.commit_unbounded(txn);
             }
         }
     }
@@ -957,7 +955,11 @@ impl Display {
         }
     }
 
-    async fn new(base: NPath, container: Container, db: Db, publisher: Publisher) -> Result<Self> {
+    async fn new(
+        base: NPath,
+        db: Db,
+        publisher: Publisher,
+    ) -> Result<Self> {
         let filter_val = publisher.publish(base.append("filter"), Value::from(""))?;
         let empty = Value::Array(Arc::from([]));
         let selected_albums_val =
@@ -1000,7 +1002,6 @@ impl Display {
             artists: HashSet::default(),
             base,
             db,
-            container,
             duration: None,
             duration_val,
             filter_changed: true,
@@ -1230,6 +1231,15 @@ fn scan_track(
     let tag = TaggedTrack::read(library, path)?;
     let hash = Digest::compute_from_file(&path)?;
     let track = base.append(&format!("tracks/{:x}", (hash.0)));
+    txn.set_formula(
+        track.append("status"),
+        Value::from(format!(
+            "if(cmp(\"eq\", load(\"{}\"), \"{}\"), \"media-playback-start\", \"\")",
+            base.append("play"),
+            hash.to_string()
+        )),
+        None,
+    );
     let mut set = |name, val: Value| {
         let key = track.append(name);
         txn.set_data(true, key, val, None);
@@ -1242,7 +1252,6 @@ fn scan_track(
         .map(Value::from)
         .unwrap_or(Value::from(Chars::from("")));
     set("track", n);
-    set("status", Value::from(""));
     set("length", Value::from(tag.length));
     set("artist", Value::from(tag.artist.clone()));
     let a = artists.entry(tag.artist.clone()).or_insert_with(Artist::new);
@@ -1457,6 +1466,6 @@ async fn main() -> Result<()> {
     let publisher = container.publisher().await?;
     let db = container.db().await?;
     init_library(&args.library_path.as_ref().unwrap(), base.clone(), &container).await?;
-    Display::new(base, container, db, publisher).await?.run().await;
+    Display::new(base, db, publisher).await?.run().await;
     Ok(())
 }
