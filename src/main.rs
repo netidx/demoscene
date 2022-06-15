@@ -1067,7 +1067,7 @@ impl TaggedTrack {
             ($field:expr, $val:expr) => {
                 if let Some(val) = $val {
                     if val.len() > $field.len() {
-                        $field = Chars::from(String::from(val));
+                        $field = Chars::from(String::from(val.trim()));
                     }
                 }
             };
@@ -1128,24 +1128,24 @@ impl TaggedTrack {
                 .and_then(|c| c.get(1).or_else(|| c.get(2)))
                 .map(|c| c.as_str());
             if let Some(nr) = nr {
-                track.track_number = Chars::from(String::from(nr));
+                track.track_number = Chars::from(String::from(nr.trim()));
             }
         }
         if EMPTY.is_match(&*track.artist) {
             if let Some(artist) = part(library, path, 2) {
-                track.artist = Chars::from(String::from(artist));
+                track.artist = Chars::from(String::from(artist.trim()));
             }
         }
         if EMPTY.is_match(&*track.album) {
             if let Some(album) = part(library, path, 1) {
-                track.album = Chars::from(String::from(album));
+                track.album = Chars::from(String::from(album.trim()));
             }
         }
         if EMPTY.is_match(&*track.title) {
             let title = path.file_stem().and_then(|p| p.to_str());
             if let Some(title) = title {
                 let title = CLEANUP.replace_all(title, "");
-                track.title = Chars::from(String::from(title));
+                track.title = Chars::from(String::from(title.trim()));
             }
         }
         Ok(track)
