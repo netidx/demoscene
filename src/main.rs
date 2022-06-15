@@ -254,8 +254,8 @@ struct Track {
 }
 
 impl Track {
-    fn load_track(db: &Db, path: &NPath) -> Option<Chars> {
-        db.lookup_value(&*path.append("track")).and_then(|v| v.get_as::<Chars>())
+    fn load_track(db: &Db, path: &NPath) -> Option<i32> {
+        db.lookup_value(&*path.append("track")).and_then(|v| v.cast_to::<i32>().ok())
     }
 
     fn load_title(db: &Db, path: &NPath) -> Option<Chars> {
@@ -524,21 +524,37 @@ impl Display {
                 visible.sort_by(|v0, v1| {
                     let path_v0 = self.tracks_path.append(&v0.to_string());
                     let path_v1 = self.tracks_path.append(&v1.to_string());
-                    let cmp = |f: fn(&Db, &NPath) -> Option<Chars>, dir: &SortDir| {
-                        let v0 = f(&self.db, &path_v0);
-                        let v1 = f(&self.db, &path_v1);
+                    fn cmp<T: Ord, F: Fn(&Db, &NPath) -> Option<T>>(
+                        db: &Db,
+                        path_v0: &NPath,
+                        path_v1: &NPath,
+                        dir: &SortDir,
+                        f: F,
+                    ) -> Ordering {
+                        let v0 = f(&db, &path_v0);
+                        let v1 = f(&db, &path_v1);
                         match dir {
                             SortDir::Descending => v0.cmp(&v1),
                             SortDir::Ascending => v1.cmp(&v0),
                         }
-                    };
+                    }
                     for (col, dir) in &self.sort_column {
                         let r = match col {
-                            SortCol::Track => cmp(Track::load_track, dir),
-                            SortCol::Title => cmp(Track::load_title, dir),
-                            SortCol::Album => cmp(Track::load_album, dir),
-                            SortCol::Artist => cmp(Track::load_artist, dir),
-                            SortCol::Genre => cmp(Track::load_genre, dir),
+                            SortCol::Track => {
+                                cmp(&self.db, &path_v0, &path_v1, dir, Track::load_track)
+                            }
+                            SortCol::Title => {
+                                cmp(&self.db, &path_v0, &path_v1, dir, Track::load_title)
+                            }
+                            SortCol::Album => {
+                                cmp(&self.db, &path_v0, &path_v1, dir, Track::load_album)
+                            }
+                            SortCol::Artist => {
+                                cmp(&self.db, &path_v0, &path_v1, dir, Track::load_artist)
+                            }
+                            SortCol::Genre => {
+                                cmp(&self.db, &path_v0, &path_v1, dir, Track::load_genre)
+                            }
                         };
                         match r {
                             o @ (Ordering::Greater | Ordering::Less) => return o,
@@ -899,7 +915,7 @@ impl Display {
         let default_sort = [
             (SortCol::Artist, SortDir::Descending),
             (SortCol::Album, SortDir::Descending),
-            (SortCol::Track, SortDir::Descending)
+            (SortCol::Track, SortDir::Descending),
         ]
         .into_iter()
         .collect::<IndexMap<_, _, FxBuildHasher>>();
@@ -1147,23 +1163,24 @@ fn scan_track(
     let tag = TaggedTrack::read(library, path)?;
     let hash = Digest::compute_from_file(&path)?;
     let track = base.append(&format!("tracks/{:x}", (hash.0)));
-    let mut set = |name, val: Chars| {
+    let mut set = |name, val: Value| {
         let key = track.append(name);
-        txn.set_data(true, key, Value::from(val), None);
+        txn.set_data(true, key, val, None);
     };
-    set("file", Chars::from(String::from(path)));
-    set("track", tag.track_number);
-    set("length", tag.length);
-    set("artist", tag.artist.clone());
+    set("file", Value::from(Chars::from(String::from(path))));
+    let n = tag.track_number.parse::<i32>().ok().map(Value::from).unwrap_or(Value::Null);
+    set("track", n);
+    set("length", Value::from(tag.length));
+    set("artist", Value::from(tag.artist.clone()));
     let a = artists.entry(tag.artist.clone()).or_insert_with(Artist::new);
     a.tracks.insert(hash);
     a.albums.insert(Digest::compute_from_bytes(&*tag.album));
-    set("title", tag.title);
-    set("album", tag.album.clone());
+    set("title", Value::from(tag.title));
+    set("album", Value::from(tag.album.clone()));
     let a = albums.entry(tag.album).or_insert_with(Album::new);
     a.tracks.insert(hash);
     a.artists.insert(Digest::compute_from_bytes(&*tag.artist));
-    set("genre", tag.genre);
+    set("genre", Value::from(tag.genre));
     Ok(())
 }
 
