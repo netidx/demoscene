@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use futures::{channel::mpsc, select_biased, StreamExt};
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use glib::clone;
-use gstreamer::prelude::*;
+use gstreamer::{prelude::*, ClockTime};
 use indexmap::{IndexMap, IndexSet};
 use log::{error, info, warn};
 use netidx::{
@@ -128,6 +128,8 @@ enum ToPlayer {
 
 enum FromPlayer {
     Finished,
+    Duration(ClockTime),
+    Position(ClockTime),
 }
 
 struct PlayerInner {
@@ -165,21 +167,39 @@ impl Player {
             Some(&dispatcher.upcast::<gstreamer_player::PlayerSignalDispatcher>()),
         );
         let current: Arc<Mutex<Option<Digest>>> = Arc::new(Mutex::new(None));
-        player.connect_end_of_stream(clone!(@strong current => move |player| {
-            info!("player finished playing");
-            player.stop();
-            if let Some(_) = current.lock().take() {
-                let _ = tx.unbounded_send(FromPlayer::Finished);
+        player.connect_end_of_stream(
+            clone!(@strong current, @strong tx => move |player| {
+                info!("player finished playing");
+                player.stop();
+                if let Some(_) = current.lock().take() {
+                    let _ = tx.unbounded_send(FromPlayer::Finished);
+                }
+            }),
+        );
+        player.connect_state_changed(clone!(@strong tx => move |player, state| {
+            use gstreamer_player::PlayerState;
+            match state {
+                PlayerState::Playing => {
+                    if let Some(t) = player.duration() {
+                        let _ = tx.unbounded_send(FromPlayer::Duration(t));
+                    }
+                }
+                _ => ()
+            }
+        }));
+        player.connect_position_updated(clone!(@strong tx => move |_, pos| {
+            if let Some(pos) = pos {
+                let _ = tx.unbounded_send(FromPlayer::Position(pos));
             }
         }));
         player.connect_error(|player, error| {
-            error!("player error: {}", error);
+            error!("player error: {} {:?}", error, player.uri());
             player.stop();
         });
         let _main_loop = main_loop.clone();
         rx.attach(
             None,
-            clone!(@strong current => move |m| {
+            clone!(@strong current, @strong tx => move |m| {
                 match m {
                     ToPlayer::Play(Some(track)) => match Self::lookup_uri(&db, &base, track) {
                         None => warn!("track {:x} not found", track.0),
@@ -389,6 +409,8 @@ struct Display {
     artists: FxHashSet<Digest>,
     base: NPath,
     db: Db,
+    duration_val: Val,
+    duration: Option<ClockTime>,
     filter_changed: bool,
     filter: Option<Regex>,
     filter_val: Val,
@@ -397,6 +419,7 @@ struct Display {
     play: PlayStatus,
     play_queue: IndexSet<Digest, FxBuildHasher>,
     play_val: Val,
+    position: Val,
     prev_track_val: Val,
     publisher: Publisher,
     repeat: bool,
@@ -405,8 +428,8 @@ struct Display {
     selected_albums_val: Val,
     selected_artists: FxHashSet<Digest>,
     selected_artists_val: Val,
-    shuffle_seed: u64,
     shuffle: bool,
+    shuffle_seed: u64,
     shuffle_val: Val,
     sort_column: IndexMap<SortCol, SortDir, FxBuildHasher>,
     sort_column_val: Val,
@@ -891,7 +914,27 @@ impl Display {
                     }
                 },
                 m = p_rx.select_next_some() => match m {
-                    FromPlayer::Finished => self.next_track(&mut updates, &player, false),
+                    FromPlayer::Duration(t) => {
+                        self.duration = Some(t);
+                        let v = if t.hours() > 0 {
+                            format!("{}:{}:{}", t.hours(), t.minutes(), t.seconds())
+                        } else {
+                            format!("{}:{}", t.minutes(), t.seconds())
+                        };
+                        self.duration_val.update(&mut updates, v.into());
+                    },
+                    FromPlayer::Position(t) => {
+                        if let Some(duration) = self.duration {
+                            let position = t.nseconds() as f64 / duration.nseconds() as f64;
+                            self.position.update(&mut updates, position.into());
+                        }
+                    },
+                    FromPlayer::Finished => {
+                        self.position.update(&mut updates, 0.into());
+                        self.duration_val.update(&mut updates, "".into());
+                        self.duration = None;
+                        self.next_track(&mut updates, &player, false)
+                    },
                 },
                 complete => break,
             }
@@ -928,6 +971,8 @@ impl Display {
         let stop_val = publisher.publish(base.append("stop"), Value::False)?;
         let next_track_val = publisher.publish(base.append("next"), Value::Null)?;
         let prev_track_val = publisher.publish(base.append("prev"), Value::Null)?;
+        let position = publisher.publish(base.append("position"), Value::from(0.))?;
+        let duration_val = publisher.publish(base.append("duration"), Value::from(""))?;
         let albums_path = base.append("albums");
         let tracks_path = base.append("tracks");
         let mut t = Self {
@@ -938,6 +983,8 @@ impl Display {
             artists: HashSet::default(),
             base,
             db,
+            duration_val,
+            duration: None,
             filter_changed: true,
             filter: None,
             filter_val,
@@ -946,6 +993,7 @@ impl Display {
             play: PlayStatus::Stopped,
             play_queue: IndexSet::default(),
             play_val,
+            position,
             prev_track_val,
             publisher,
             repeat: false,
@@ -954,8 +1002,8 @@ impl Display {
             selected_albums_val,
             selected_artists: HashSet::default(),
             selected_artists_val,
-            shuffle_seed: random(),
             shuffle: false,
+            shuffle_seed: random(),
             shuffle_val,
             sort_column: default_sort,
             sort_column_val,
