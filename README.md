@@ -16,7 +16,7 @@ and programatically over the network via the netidx api, however it
 also includes a default graphical view designed in and for the netidx
 browser.
 
-[Screenshot](screenshot.png)
+![Screenshot](screenshot.png)
 
 The user can customize this view as desired.
 
