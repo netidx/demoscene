@@ -202,7 +202,10 @@ impl Player {
                 _ => ()
             }
         }));
-        player.connect_position_updated(clone!(@strong tx => move |_, pos| {
+        player.connect_position_updated(clone!(@strong tx => move |player, pos| {
+            if let Some(t) = player.duration() {
+                let _ = tx.unbounded_send(FromPlayer::Duration(t));
+            }
             if let Some(pos) = pos {
                 let _ = tx.unbounded_send(FromPlayer::Position(pos));
             }
@@ -933,13 +936,13 @@ impl Display {
                     FromPlayer::Duration(t) => {
                         self.duration = Some(t);
                         let v = pretty_clock_time(t);
-                        self.duration_val.update(&mut updates, v.into());
+                        self.duration_val.update_changed(&mut updates, v.into());
                     },
                     FromPlayer::Position(t) => {
                         if let Some(duration) = self.duration {
                             let position = t.nseconds() as f64 / duration.nseconds() as f64;
-                            self.position_fraction.update(&mut updates, position.into());
-                            self.position.update(&mut updates, pretty_clock_time(t).into());
+                            self.position_fraction.update_changed(&mut updates, position.into());
+                            self.position.update_changed(&mut updates, pretty_clock_time(t).into());
                         }
                     },
                     FromPlayer::Finished => {
@@ -955,11 +958,7 @@ impl Display {
         }
     }
 
-    async fn new(
-        base: NPath,
-        db: Db,
-        publisher: Publisher,
-    ) -> Result<Self> {
+    async fn new(base: NPath, db: Db, publisher: Publisher) -> Result<Self> {
         let filter_val = publisher.publish(base.append("filter"), Value::from(""))?;
         let empty = Value::Array(Arc::from([]));
         let selected_albums_val =
