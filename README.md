@@ -1,6 +1,6 @@
 # Demoscene
 
-Demoscene is an advanced example and proof of concept desktop
+Demoscene is a long form example and proof of concept desktop
 application built using netidx. It is a clone of the essential (to me)
 features of Rhythmbox.
 
