@@ -1121,7 +1121,6 @@ impl TaggedTrack {
                 Regex::new("^[[:^alpha:]0-9\\s]*|[[:^alpha:]0-9\\s]*$").unwrap();
             static ref EMPTY: Regex = Regex::new("^\\s*$").unwrap();
         }
-        let tags = read_from_path(path, false)?;
         let mut track = Self {
             track_number: Chars::from(""),
             length: Chars::from(""),
@@ -1139,22 +1138,24 @@ impl TaggedTrack {
                 }
             };
         }
-        for tag in tags.tags() {
-            set!(track.title, tag.title());
-            set!(track.artist, tag.artist());
-            set!(track.album, tag.album());
-            set!(track.genre, tag.genre());
-            for item in tag.items() {
-                match item.key() {
-                    ItemKey::TrackNumber => match item.value() {
-                        ItemValue::Text(s) => set!(track.track_number, Some(s.as_str())),
-                        ItemValue::Binary(_) | ItemValue::Locator(_) => (),
-                    },
-                    ItemKey::Length => match item.value() {
-                        ItemValue::Text(s) => set!(track.length, Some(s.as_str())),
-                        ItemValue::Binary(_) | ItemValue::Locator(_) => (),
-                    },
-                    _ => (),
+        if let Ok(tags) = read_from_path(path, false) {
+            for tag in tags.tags() {
+                set!(track.title, tag.title());
+                set!(track.artist, tag.artist());
+                set!(track.album, tag.album());
+                set!(track.genre, tag.genre());
+                for item in tag.items() {
+                    match item.key() {
+                        ItemKey::TrackNumber => match item.value() {
+                            ItemValue::Text(s) => set!(track.track_number, Some(s.as_str())),
+                            ItemValue::Binary(_) | ItemValue::Locator(_) => (),
+                        },
+                        ItemKey::Length => match item.value() {
+                            ItemValue::Text(s) => set!(track.length, Some(s.as_str())),
+                            ItemValue::Binary(_) | ItemValue::Locator(_) => (),
+                        },
+                        _ => (),
+                    }
                 }
             }
         }
@@ -1409,7 +1410,6 @@ async fn init_library(
     let db = container.db().await?;
     let roots = db.roots().collect::<Result<Vec<_>>>()?;
     let dirs_tree = db.open_tree("dirs")?;
-    setup_default_view(container, &db, &base).await?;
     if roots.contains(&base) {
         block_in_place(|| {
             scan_modified(library_path, &base, container, &db, &dirs_tree)
@@ -1428,6 +1428,7 @@ async fn init_library(
             scan_everything(library_path, &base, container, &db, &dirs_tree)
         })?;
     }
+    setup_default_view(container, &db, &base).await?;
     Ok(())
 }
 
