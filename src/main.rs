@@ -946,7 +946,8 @@ impl Display {
                         }
                     },
                     FromPlayer::Finished => {
-                        self.position.update(&mut updates, (0.).into());
+                        self.position_fraction.update(&mut updates, (0.).into());
+                        self.position.update(&mut updates, "".into());
                         self.duration_val.update(&mut updates, "".into());
                         self.duration = None;
                         self.next_track(&mut updates, &player, false)
