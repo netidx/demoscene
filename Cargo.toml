@@ -26,10 +26,10 @@ gstreamer-player = "0.18"
 lofty = "0.6"
 log = "0.4"
 md5 = "0.7"
-netidx-container = { version = "0.10", path = "../netidx/netidx-container" }
-netidx-protocols = { version = "0.10", path = "../netidx/netidx-protocols" }
-netidx-tools = { version = "0.10", path = "../netidx/netidx-tools" }
-netidx = { version = "0.10", path = "../netidx/netidx" }
+netidx-container = { version = "0.11", path = "../netidx/netidx-container" }
+netidx-protocols = { version = "0.11", path = "../netidx/netidx-protocols" }
+netidx-tools = { version = "0.11", path = "../netidx/netidx-tools" }
+netidx = { version = "0.11", path = "../netidx/netidx" }
 rayon = "1"
 regex = "1"
 sled = { version = "0.34", features = ["zstd", "compression"] }
