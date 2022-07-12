@@ -50,6 +50,8 @@ struct Params {
         default_value = "/local/music"
     )]
     base: String,
+    #[structopt(long = "rescan", help = "force full library rescan")]
+    rescan: bool
 }
 
 fn pretty_clock_time(t: ClockTime) -> String {
@@ -1102,6 +1104,7 @@ fn dirs_to_scan(
     Ok(res)
 }
 
+#[derive(Debug)]
 struct TaggedTrack {
     track_number: Chars,
     length: Chars,
@@ -1405,13 +1408,14 @@ async fn setup_default_view(container: &Container, db: &Db, base: &NPath) -> Res
 
 async fn init_library(
     library_path: &str,
+    rescan: bool,
     base: NPath,
     container: &Container,
 ) -> Result<()> {
     let db = container.db().await?;
     let roots = db.roots().collect::<Result<Vec<_>>>()?;
     let dirs_tree = db.open_tree("dirs")?;
-    if roots.contains(&base) {
+    if !rescan && roots.contains(&base) {
         block_in_place(|| {
             scan_modified(library_path, &base, container, &db, &dirs_tree)
         })?;
@@ -1466,7 +1470,7 @@ async fn main() -> Result<()> {
     let container = Container::start(config, desired_auth, args.container_config).await?;
     let publisher = container.publisher().await?;
     let db = container.db().await?;
-    init_library(&args.library_path.as_ref().unwrap(), base.clone(), &container).await?;
+    init_library(&args.library_path.as_ref().unwrap(), args.rescan, base.clone(), &container).await?;
     Display::new(base, db, publisher).await?.run().await;
     Ok(())
 }
