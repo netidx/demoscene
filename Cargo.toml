@@ -1,6 +1,6 @@
 [package]
 name = "demoscene"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 readme = "README.md"
 authors = ["Eric Stokes <letaris@gmail.com>"]
@@ -30,13 +30,13 @@ fxhash = "0.2"
 glib = "0.15"
 gstreamer = "0.18"
 gstreamer-player = "0.18"
-lofty = "0.6"
+lofty = "0.7"
 log = "0.4"
 md5 = "0.7"
-netidx-container = { version = "0.11", path = "../netidx/netidx-container" }
-netidx-protocols = { version = "0.11", path = "../netidx/netidx-protocols" }
-netidx-tools = { version = "0.11", path = "../netidx/netidx-tools" }
-netidx = { version = "0.11", path = "../netidx/netidx" }
+netidx-container = { version = "0.12", path = "../netidx/netidx-container" }
+netidx-protocols = { version = "0.12", path = "../netidx/netidx-protocols" }
+netidx-tools-core = { version = "0.12", path = "../netidx/netidx-tools-core" }
+netidx = { version = "0.12", path = "../netidx/netidx" }
 rayon = "1"
 regex = "1"
 sled = { version = "0.34", features = ["zstd", "compression"] }

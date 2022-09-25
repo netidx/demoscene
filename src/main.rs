@@ -16,7 +16,7 @@ use netidx::{
     utils::pack,
 };
 use netidx_container::{Container, Datum, Db, Params as ContainerParams, Txn};
-use netidx_tools::ClientParams;
+use netidx_tools_core::ClientParams;
 use parking_lot::Mutex;
 use rand::prelude::*;
 use regex::Regex;
