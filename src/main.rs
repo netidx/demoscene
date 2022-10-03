@@ -1,7 +1,10 @@
 #[macro_use]
 extern crate lazy_static;
 use anyhow::{anyhow, bail, Result};
-use futures::{channel::mpsc, select_biased, StreamExt};
+use futures::{
+    channel::{mpsc, oneshot},
+    select_biased, StreamExt,
+};
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use glib::clone;
 use gstreamer::{prelude::*, ClockTime};
@@ -51,7 +54,7 @@ struct Params {
     )]
     base: String,
     #[structopt(long = "rescan", help = "force full library rescan")]
-    rescan: bool
+    rescan: bool,
 }
 
 fn pretty_clock_time(t: ClockTime) -> String {
@@ -140,7 +143,7 @@ enum ToPlayer {
     Play(Option<Digest>),
     Pause,
     Stop,
-    Terminate,
+    Terminate(Option<oneshot::Sender<()>>),
 }
 
 enum FromPlayer {
@@ -150,12 +153,15 @@ enum FromPlayer {
 }
 
 struct PlayerInner {
-    to: glib::Sender<ToPlayer>,
+    db: Db,
+    base: NPath,
+    from: mpsc::UnboundedSender<FromPlayer>,
+    to: Mutex<glib::Sender<ToPlayer>>,
 }
 
 impl Drop for PlayerInner {
     fn drop(&mut self) {
-        let _ = self.to.send(ToPlayer::Terminate);
+        let _ = self.to.lock().send(ToPlayer::Terminate(None));
     }
 }
 
@@ -176,7 +182,7 @@ impl Player {
         tx: mpsc::UnboundedSender<FromPlayer>,
         rx: glib::Receiver<ToPlayer>,
     ) -> Result<()> {
-        gstreamer::init()?;
+        use std::{cell::RefCell, rc::Rc};
         let main_loop = glib::MainLoop::new(None, false);
         let dispatcher = gstreamer_player::PlayerGMainContextSignalDispatcher::new(None);
         let player = gstreamer_player::Player::new(
@@ -184,6 +190,8 @@ impl Player {
             Some(&dispatcher.upcast::<gstreamer_player::PlayerSignalDispatcher>()),
         );
         let current: Arc<Mutex<Option<Digest>>> = Arc::new(Mutex::new(None));
+        let terminated: Rc<RefCell<Option<oneshot::Sender<()>>>> =
+            Rc::new(RefCell::new(None));
         player.connect_end_of_stream(
             clone!(@strong current, @strong tx => move |player| {
                 info!("player finished playing");
@@ -217,70 +225,89 @@ impl Player {
             player.stop();
         });
         let _main_loop = main_loop.clone();
-        rx.attach(
-            None,
-            clone!(@strong current, @strong tx => move |m| {
-                match m {
-                    ToPlayer::Play(Some(track)) => match Self::lookup_uri(&db, &base, track) {
-                        None => warn!("track {:x} not found", track.0),
-                        Some(uri) => {
-                            info!("player now playing {:x}, {}", track.0, uri);
-                            player.set_uri(Some(uri.as_str()));
-                            player.play();
-                            *current.lock() = Some(track);
-                        }
+        rx.attach(None, clone!(@strong current, @strong tx, @strong terminated => move |m| {
+            match m {
+                ToPlayer::Play(Some(track)) => match Self::lookup_uri(&db, &base, track) {
+                    None => warn!("track {:x} not found", track.0),
+                    Some(uri) => {
+                        info!("player now playing {:x}, {}", track.0, uri);
+                        player.set_uri(Some(uri.as_str()));
+                        player.play();
+                        *current.lock() = Some(track);
                     }
-                    ToPlayer::Play(None) => match &*current.lock() {
-                        None => warn!("not paused, nothing to resume"),
-                        Some(track) => {
-                            info!("resumimg {:x}", track.0);
-                            player.play();
-                        }
+                }
+                ToPlayer::Play(None) => match &*current.lock() {
+                    None => warn!("not paused, nothing to resume"),
+                    Some(track) => {
+                        info!("resumimg {:x}", track.0);
+                        player.play();
                     }
-                    ToPlayer::Pause => match &*current.lock() {
-                        None => warn!("not playing, can't pause"),
-                        Some(track) => {
-                            info!("pausing {:x}", track.0);
-                            player.pause();
-                        }
+                }
+                ToPlayer::Pause => match &*current.lock() {
+                    None => warn!("not playing, can't pause"),
+                    Some(track) => {
+                        info!("pausing {:x}", track.0);
+                        player.pause();
                     }
-                    ToPlayer::Stop => {
-                        info!("player stopped");
-                        player.stop();
-                        *current.lock() = None;
-                    }
-                    ToPlayer::Terminate => {
-                        info!("player shutting down");
-                        _main_loop.quit();
-                        return glib::Continue(false)
-                    }
-                };
-                glib::Continue(true)
-            }),
-        );
+                }
+                ToPlayer::Stop => {
+                    info!("player stopped");
+                    player.stop();
+                    *current.lock() = None;
+                }
+                ToPlayer::Terminate(on_terminated) => {
+                    *terminated.borrow_mut() = on_terminated;
+                    info!("player shutting down");
+                    _main_loop.quit();
+                    return glib::Continue(false)
+                }
+            };
+            glib::Continue(true)
+        }));
         main_loop.run();
+        if let Some(terminated) = terminated.borrow_mut().take() {
+            let _ = terminated.send(());
+        }
         Ok(())
     }
 
-    fn new(db: Db, base: NPath, from: mpsc::UnboundedSender<FromPlayer>) -> Self {
+    fn start(
+        db: Db,
+        base: NPath,
+        from: mpsc::UnboundedSender<FromPlayer>,
+    ) -> glib::Sender<ToPlayer> {
         let (tx, rx) = glib::MainContext::channel(glib::PRIORITY_LOW);
         thread::spawn(move || match Self::task(db, base, from, rx) {
             Ok(()) => info!("player task stopped"),
             Err(e) => error!("player task stopped with error: {}", e),
         });
-        Player(Arc::new(PlayerInner { to: tx }))
+        tx
+    }
+
+    fn new(db: Db, base: NPath, from: mpsc::UnboundedSender<FromPlayer>) -> Result<Self> {
+        gstreamer::init()?;
+        let tx = Player::start(db.clone(), base.clone(), from.clone());
+        Ok(Player(Arc::new(PlayerInner { db, base, from, to: Mutex::new(tx) })))
     }
 
     fn play(&self, track: Option<Digest>) -> Result<()> {
-        Ok(self.0.to.send(ToPlayer::Play(track))?)
+        Ok(self.0.to.lock().send(ToPlayer::Play(track))?)
     }
 
     fn pause(&self) -> Result<()> {
-        Ok(self.0.to.send(ToPlayer::Pause)?)
+        Ok(self.0.to.lock().send(ToPlayer::Pause)?)
     }
 
     fn stop(&self) -> Result<()> {
-        Ok(self.0.to.send(ToPlayer::Stop)?)
+        Ok(self.0.to.lock().send(ToPlayer::Stop)?)
+    }
+
+    async fn restart(&self) {
+        let (term_tx, term_rx) = oneshot::channel();
+        let _ = self.0.to.lock().send(ToPlayer::Terminate(Some(term_tx)));
+        let _ = term_rx.await;
+        *self.0.to.lock() =
+            Player::start(self.0.db.clone(), self.0.base.clone(), self.0.from.clone());
     }
 }
 
@@ -445,6 +472,7 @@ struct Display {
     publisher: Publisher,
     repeat: bool,
     repeat_val: Val,
+    restart_player: Val,
     selected_albums: FxHashSet<Digest>,
     selected_albums_val: Val,
     selected_artists: FxHashSet<Digest>,
@@ -872,10 +900,10 @@ impl Display {
         }
     }
 
-    async fn run(mut self) {
+    async fn run(mut self) -> Result<()> {
         let (p_tx, mut p_rx) = mpsc::unbounded();
         let (w_tx, mut w_rx) = mpsc::channel(3);
-        let player = Player::new(self.db.clone(), self.base.clone(), p_tx);
+        let player = Player::new(self.db.clone(), self.base.clone(), p_tx)?;
         self.publisher.writes(self.selected_albums_val.id(), w_tx.clone());
         self.publisher.writes(self.selected_artists_val.id(), w_tx.clone());
         self.publisher.writes(self.filter_val.id(), w_tx.clone());
@@ -883,6 +911,7 @@ impl Display {
         self.publisher.writes(self.pause_val.id(), w_tx.clone());
         self.publisher.writes(self.play_val.id(), w_tx.clone());
         self.publisher.writes(self.repeat_val.id(), w_tx.clone());
+        self.publisher.writes(self.restart_player.id(), w_tx.clone());
         self.publisher.writes(self.shuffle_val.id(), w_tx.clone());
         self.publisher.writes(self.stop_val.id(), w_tx.clone());
         self.publisher.writes(self.next_track_val.id(), w_tx.clone());
@@ -916,6 +945,9 @@ impl Display {
                             }
                             id if id == self.repeat_val.id() => {
                                 self.repeat(&mut updates, req)
+                            }
+                            id if id == self.restart_player.id() => {
+                                player.restart().await
                             }
                             id if id == self.shuffle_val.id() => {
                                 self.shuffle(&mut updates, req)
@@ -959,6 +991,7 @@ impl Display {
             }
             updates.commit(None).await;
         }
+        Ok(())
     }
 
     async fn new(base: NPath, db: Db, publisher: Publisher) -> Result<Self> {
@@ -985,6 +1018,8 @@ impl Display {
             .publish(base.append("sort-column"), (false, default_sort.clone()).into())?;
         let shuffle_val = publisher.publish(base.append("shuffle"), Value::False)?;
         let repeat_val = publisher.publish(base.append("repeat"), Value::False)?;
+        let restart_player =
+            publisher.publish(base.append("restart-player"), Value::Null)?;
         let play_val = publisher.publish(base.append("play"), Value::False)?;
         let pause_val = publisher.publish(base.append("pause"), Value::False)?;
         let stop_val = publisher.publish(base.append("stop"), Value::False)?;
@@ -1020,6 +1055,7 @@ impl Display {
             publisher,
             repeat: false,
             repeat_val,
+            restart_player,
             selected_albums: HashSet::default(),
             selected_albums_val,
             selected_artists: HashSet::default(),
@@ -1151,7 +1187,9 @@ impl TaggedTrack {
                 for item in tag.items() {
                     match item.key() {
                         ItemKey::TrackNumber => match item.value() {
-                            ItemValue::Text(s) => set!(track.track_number, Some(s.as_str())),
+                            ItemValue::Text(s) => {
+                                set!(track.track_number, Some(s.as_str()))
+                            }
                             ItemValue::Binary(_) | ItemValue::Locator(_) => (),
                         },
                         ItemKey::Length => match item.value() {
@@ -1470,7 +1508,13 @@ async fn main() -> Result<()> {
     let container = Container::start(config, desired_auth, args.container_config).await?;
     let publisher = container.publisher().await?;
     let db = container.db().await?;
-    init_library(&args.library_path.as_ref().unwrap(), args.rescan, base.clone(), &container).await?;
-    Display::new(base, db, publisher).await?.run().await;
+    init_library(
+        &args.library_path.as_ref().unwrap(),
+        args.rescan,
+        base.clone(),
+        &container,
+    )
+    .await?;
+    Display::new(base, db, publisher).await?.run().await?;
     Ok(())
 }
