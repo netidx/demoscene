@@ -8,6 +8,7 @@ use futures::{
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use glib::clone;
 use gstreamer::{prelude::*, ClockTime};
+use gstreamer_player::PlayerVideoRenderer;
 use indexmap::{IndexMap, IndexSet};
 use log::{error, info, warn};
 use netidx::{
@@ -156,12 +157,12 @@ struct PlayerInner {
     db: Db,
     base: NPath,
     from: mpsc::UnboundedSender<FromPlayer>,
-    to: Mutex<glib::Sender<ToPlayer>>,
+    to: Mutex<mpsc::UnboundedSender<ToPlayer>>,
 }
 
 impl Drop for PlayerInner {
     fn drop(&mut self) {
-        let _ = self.to.lock().send(ToPlayer::Terminate(None));
+        let _ = self.to.lock().unbounded_send(ToPlayer::Terminate(None));
     }
 }
 
@@ -180,90 +181,110 @@ impl Player {
         db: Db,
         base: NPath,
         tx: mpsc::UnboundedSender<FromPlayer>,
-        rx: glib::Receiver<ToPlayer>,
+        mut rx: mpsc::UnboundedReceiver<ToPlayer>,
     ) -> Result<()> {
         use std::{cell::RefCell, rc::Rc};
         let main_loop = glib::MainLoop::new(None, false);
         let dispatcher = gstreamer_player::PlayerGMainContextSignalDispatcher::new(None);
         let player = gstreamer_player::Player::new(
-            gstreamer_player::PlayerVideoRenderer::NONE,
-            Some(&dispatcher.upcast::<gstreamer_player::PlayerSignalDispatcher>()),
+            None::<PlayerVideoRenderer>,
+            Some(dispatcher.upcast::<gstreamer_player::PlayerSignalDispatcher>()),
         );
         let current: Arc<Mutex<Option<Digest>>> = Arc::new(Mutex::new(None));
         let terminated: Rc<RefCell<Option<oneshot::Sender<()>>>> =
             Rc::new(RefCell::new(None));
-        player.connect_end_of_stream(
-            clone!(@strong current, @strong tx => move |player| {
+        player.connect_end_of_stream(clone!(
+            #[strong]
+            current,
+            #[strong]
+            tx,
+            move |player| {
                 info!("player finished playing");
                 player.stop();
                 if let Some(_) = current.lock().take() {
                     let _ = tx.unbounded_send(FromPlayer::Finished);
                 }
-            }),
-        );
-        player.connect_state_changed(clone!(@strong tx => move |player, state| {
-            use gstreamer_player::PlayerState;
-            match state {
-                PlayerState::Playing => {
-                    if let Some(t) = player.duration() {
-                        let _ = tx.unbounded_send(FromPlayer::Duration(t));
+            }
+        ));
+        player.connect_state_changed(clone!(
+            #[strong]
+            tx,
+            move |player, state| {
+                use gstreamer_player::PlayerState;
+                match state {
+                    PlayerState::Playing => {
+                        if let Some(t) = player.duration() {
+                            let _ = tx.unbounded_send(FromPlayer::Duration(t));
+                        }
                     }
+                    _ => (),
                 }
-                _ => ()
             }
-        }));
-        player.connect_position_updated(clone!(@strong tx => move |player, pos| {
-            if let Some(t) = player.duration() {
-                let _ = tx.unbounded_send(FromPlayer::Duration(t));
+        ));
+        player.connect_position_updated(clone!(
+            #[strong]
+            tx,
+            move |player, pos| {
+                if let Some(t) = player.duration() {
+                    let _ = tx.unbounded_send(FromPlayer::Duration(t));
+                }
+                if let Some(pos) = pos {
+                    let _ = tx.unbounded_send(FromPlayer::Position(pos));
+                }
             }
-            if let Some(pos) = pos {
-                let _ = tx.unbounded_send(FromPlayer::Position(pos));
-            }
-        }));
+        ));
         player.connect_error(|player, error| {
             error!("player error: {} {:?}", error, player.uri());
             player.stop();
         });
-        let _main_loop = main_loop.clone();
-        rx.attach(None, clone!(@strong current, @strong tx, @strong terminated => move |m| {
-            match m {
-                ToPlayer::Play(Some(track)) => match Self::lookup_uri(&db, &base, track) {
-                    None => warn!("track {:x} not found", track.0),
-                    Some(uri) => {
-                        info!("player now playing {:x}, {}", track.0, uri);
-                        player.set_uri(Some(uri.as_str()));
-                        player.play();
-                        *current.lock() = Some(track);
+        let main_loop = main_loop.clone();
+        main_loop.context().spawn_local({
+            let current = current.clone();
+            let terminated = terminated.clone();
+            let main_loop = main_loop.clone();
+            async move {
+                while let Some(m) = rx.next().await {
+                    match m {
+                        ToPlayer::Play(Some(track)) => {
+                            match Self::lookup_uri(&db, &base, track) {
+                                None => warn!("track {:x} not found", track.0),
+                                Some(uri) => {
+                                    info!("player now playing {:x}, {}", track.0, uri);
+                                    player.set_uri(Some(uri.as_str()));
+                                    player.play();
+                                    *current.lock() = Some(track);
+                                }
+                            }
+                        }
+                        ToPlayer::Play(None) => match &*current.lock() {
+                            None => warn!("not paused, nothing to resume"),
+                            Some(track) => {
+                                info!("resumimg {:x}", track.0);
+                                player.play();
+                            }
+                        },
+                        ToPlayer::Pause => match &*current.lock() {
+                            None => warn!("not playing, can't pause"),
+                            Some(track) => {
+                                info!("pausing {:x}", track.0);
+                                player.pause();
+                            }
+                        },
+                        ToPlayer::Stop => {
+                            info!("player stopped");
+                            player.stop();
+                            *current.lock() = None;
+                        }
+                        ToPlayer::Terminate(on_terminated) => {
+                            *terminated.borrow_mut() = on_terminated;
+                            info!("player shutting down");
+                            main_loop.quit();
+                            break;
+                        }
                     }
                 }
-                ToPlayer::Play(None) => match &*current.lock() {
-                    None => warn!("not paused, nothing to resume"),
-                    Some(track) => {
-                        info!("resumimg {:x}", track.0);
-                        player.play();
-                    }
-                }
-                ToPlayer::Pause => match &*current.lock() {
-                    None => warn!("not playing, can't pause"),
-                    Some(track) => {
-                        info!("pausing {:x}", track.0);
-                        player.pause();
-                    }
-                }
-                ToPlayer::Stop => {
-                    info!("player stopped");
-                    player.stop();
-                    *current.lock() = None;
-                }
-                ToPlayer::Terminate(on_terminated) => {
-                    *terminated.borrow_mut() = on_terminated;
-                    info!("player shutting down");
-                    _main_loop.quit();
-                    return glib::Continue(false)
-                }
-            };
-            glib::Continue(true)
-        }));
+            }
+        });
         main_loop.run();
         if let Some(terminated) = terminated.borrow_mut().take() {
             let _ = terminated.send(());
@@ -275,8 +296,8 @@ impl Player {
         db: Db,
         base: NPath,
         from: mpsc::UnboundedSender<FromPlayer>,
-    ) -> glib::Sender<ToPlayer> {
-        let (tx, rx) = glib::MainContext::channel(glib::PRIORITY_LOW);
+    ) -> mpsc::UnboundedSender<ToPlayer> {
+        let (tx, rx) = mpsc::unbounded();
         thread::spawn(move || match Self::task(db, base, from, rx) {
             Ok(()) => info!("player task stopped"),
             Err(e) => error!("player task stopped with error: {}", e),
@@ -291,20 +312,20 @@ impl Player {
     }
 
     fn play(&self, track: Option<Digest>) -> Result<()> {
-        Ok(self.0.to.lock().send(ToPlayer::Play(track))?)
+        Ok(self.0.to.lock().unbounded_send(ToPlayer::Play(track))?)
     }
 
     fn pause(&self) -> Result<()> {
-        Ok(self.0.to.lock().send(ToPlayer::Pause)?)
+        Ok(self.0.to.lock().unbounded_send(ToPlayer::Pause)?)
     }
 
     fn stop(&self) -> Result<()> {
-        Ok(self.0.to.lock().send(ToPlayer::Stop)?)
+        Ok(self.0.to.lock().unbounded_send(ToPlayer::Stop)?)
     }
 
     async fn restart(&self) {
         let (term_tx, term_rx) = oneshot::channel();
-        let _ = self.0.to.lock().send(ToPlayer::Terminate(Some(term_tx)));
+        let _ = self.0.to.lock().unbounded_send(ToPlayer::Terminate(Some(term_tx)));
         let _ = term_rx.await;
         *self.0.to.lock() =
             Player::start(self.0.db.clone(), self.0.base.clone(), self.0.from.clone());
@@ -774,12 +795,12 @@ impl Display {
                     *d = SortDir::Ascending;
                 }
                 SortDir::Ascending => {
-                    e.remove();
+                    e.shift_remove();
                 }
             },
         }
         let v = (false, self.sort_column.clone());
-        self.sort_column_val.update_changed(updates, v.into());
+        self.sort_column_val.update_changed(updates, v);
     }
 
     fn play(&mut self, up: &mut UpdateBatch, player: &Player, req: WriteRequest) {
@@ -787,7 +808,7 @@ impl Display {
             Some(track) => {
                 self.pause_val.update_changed(up, Value::False);
                 self.stop_val.update_changed(up, Value::False);
-                self.play_val.update_changed(up, track.into());
+                self.play_val.update_changed(up, track);
                 let _ = player.play(Some(track)); // best effort
                 self.play = PlayStatus::Playing(track);
             }
@@ -795,14 +816,14 @@ impl Display {
                 PlayStatus::Playing(track) => {
                     self.pause_val.update_changed(up, Value::True);
                     self.stop_val.update_changed(up, Value::False);
-                    self.play_val.update_changed(up, track.into());
+                    self.play_val.update_changed(up, track);
                     let _ = player.pause();
                     self.play = PlayStatus::Paused(track);
                 }
                 PlayStatus::Paused(track) => {
                     self.pause_val.update_changed(up, Value::False);
                     self.stop_val.update_changed(up, Value::False);
-                    self.play_val.update_changed(up, track.into());
+                    self.play_val.update_changed(up, track);
                     let _ = player.play(None);
                     self.play = PlayStatus::Playing(track);
                 }
@@ -811,7 +832,7 @@ impl Display {
                     Some(track) => {
                         self.pause_val.update_changed(up, Value::False);
                         self.stop_val.update_changed(up, Value::False);
-                        self.play_val.update_changed(up, track.into());
+                        self.play_val.update_changed(up, track);
                         let _ = player.play(Some(*track));
                         self.play = PlayStatus::Playing(*track);
                     }
@@ -825,7 +846,7 @@ impl Display {
             PlayStatus::Playing(track) => {
                 self.pause_val.update_changed(up, Value::True);
                 self.stop_val.update_changed(up, Value::False);
-                self.play_val.update_changed(up, track.into());
+                self.play_val.update_changed(up, track);
                 let _ = player.pause();
                 self.play = PlayStatus::Paused(track);
             }
@@ -843,7 +864,7 @@ impl Display {
 
     fn repeat(&mut self, up: &mut UpdateBatch, req: WriteRequest) {
         self.repeat = req.value.cast_to::<bool>().unwrap_or(!self.repeat);
-        self.repeat_val.update_changed(up, self.repeat.into());
+        self.repeat_val.update_changed(up, self.repeat);
     }
 
     fn shuffle(&mut self, up: &mut UpdateBatch, req: WriteRequest) {
@@ -851,7 +872,7 @@ impl Display {
             self.shuffle_seed = random();
         }
         self.shuffle = req.value.cast_to::<bool>().unwrap_or(!self.shuffle);
-        self.shuffle_val.update_changed(up, self.shuffle.into());
+        self.shuffle_val.update_changed(up, self.shuffle);
     }
 
     fn next_track(&mut self, up: &mut UpdateBatch, player: &Player, rev: bool) {
@@ -891,7 +912,7 @@ impl Display {
                     }
                     Some(track) => {
                         self.stop_val.update_changed(up, Value::False);
-                        self.play_val.update_changed(up, track.into());
+                        self.play_val.update_changed(up, track);
                         let _ = player.play(Some(*track));
                         self.play = PlayStatus::Playing(*track);
                     }
@@ -970,19 +991,19 @@ impl Display {
                     FromPlayer::Duration(t) => {
                         self.duration = Some(t);
                         let v = pretty_clock_time(t);
-                        self.duration_val.update_changed(&mut updates, v.into());
+                        self.duration_val.update_changed(&mut updates, v);
                     },
                     FromPlayer::Position(t) => {
                         if let Some(duration) = self.duration {
                             let position = t.nseconds() as f64 / duration.nseconds() as f64;
-                            self.position_fraction.update_changed(&mut updates, position.into());
-                            self.position.update_changed(&mut updates, pretty_clock_time(t).into());
+                            self.position_fraction.update_changed(&mut updates, position);
+                            self.position.update_changed(&mut updates, pretty_clock_time(t));
                         }
                     },
                     FromPlayer::Finished => {
-                        self.position_fraction.update(&mut updates, (0.).into());
-                        self.position.update(&mut updates, "".into());
-                        self.duration_val.update(&mut updates, "".into());
+                        self.position_fraction.update(&mut updates, 0.);
+                        self.position.update(&mut updates, "");
+                        self.duration_val.update(&mut updates, "");
                         self.duration = None;
                         self.next_track(&mut updates, &player, false)
                     },
@@ -1015,7 +1036,7 @@ impl Display {
         .into_iter()
         .collect::<IndexMap<_, _, FxBuildHasher>>();
         let sort_column_val = publisher
-            .publish(base.append("sort-column"), (false, default_sort.clone()).into())?;
+            .publish(base.append("sort-column"), (false, default_sort.clone()))?;
         let shuffle_val = publisher.publish(base.append("shuffle"), Value::False)?;
         let repeat_val = publisher.publish(base.append("repeat"), Value::False)?;
         let restart_player =
@@ -1152,7 +1173,7 @@ struct TaggedTrack {
 
 impl TaggedTrack {
     fn read(library: &str, path: &str) -> Result<TaggedTrack> {
-        use lofty::{read_from_path, Accessor, ItemKey, ItemValue};
+        use lofty::{prelude::*, read_from_path, tag::ItemValue};
         use std::path::Path;
         lazy_static! {
             static ref TRACK_NR: Regex =
@@ -1178,7 +1199,7 @@ impl TaggedTrack {
                 }
             };
         }
-        if let Ok(tags) = read_from_path(path, false) {
+        if let Ok(tags) = read_from_path(path) {
             for tag in tags.tags() {
                 set!(track.title, tag.title());
                 set!(track.artist, tag.artist());

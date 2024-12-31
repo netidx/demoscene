@@ -1,6 +1,6 @@
 [package]
 name = "demoscene"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 readme = "README.md"
 authors = ["Eric Stokes <letaris@gmail.com>"]
@@ -24,27 +24,27 @@ debug = 1
 [dependencies]
 anyhow = "1"
 arcstr = "1"
-env_logger = "0.9"
+env_logger = "0.11"
 futures = "0.3"
 fxhash = "0.2"
-glib = "0.15"
-gstreamer = "0.18"
-gstreamer-player = "0.18"
-lofty = "0.8"
+glib = "0.20"
+gstreamer = "0.23"
+gstreamer-player = "0.23"
+lofty = "0.21"
 log = "0.4"
 md5 = "0.7"
-netidx-container = { version = "0.12", path = "../netidx/netidx-container" }
-netidx-protocols = { version = "0.12", path = "../netidx/netidx-protocols" }
-netidx-tools-core = { version = "0.12", path = "../netidx/netidx-tools-core" }
-netidx = { version = "0.12", path = "../netidx/netidx" }
+netidx-container = "0.27"
+netidx-protocols = "0.27"
+netidx-tools-core = "0.27"
+netidx = "0.27"
 rayon = "1"
 regex = "1"
 sled = { version = "0.34", features = ["zstd", "compression"] }
 structopt = "0.3"
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
-indexmap = "1"
+indexmap = "2"
 parking_lot = "0.12"
 rand = "0.8"
-dirs = "4"
+dirs = "5"
 lazy_static = "1"
